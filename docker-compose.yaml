@@ -1,0 +1,53 @@
+name: originvault
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-originvault}
+      POSTGRES_USER: ${POSTGRES_USER:-originvault}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-originvault}
+    volumes:
+      - ./data/postgresql:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-originvault}:${POSTGRES_PASSWORD:-originvault}@postgres:5432/${POSTGRES_DB:-originvault}
+      JWT_SECRET: ${JWT_SECRET:-development-only-secret-change-me}
+      SHARE_SECRET: ${SHARE_SECRET:-}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      DATA_ROOT: /data/files
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-10737418240}
+      LOG_LEVEL: ${LOG_LEVEL:-trace}
+      LOG_DIR: /data/logs
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-7}
+    volumes:
+      - ./data:/data
+    ports:
+      - "${BACKEND_PORT:-4000}:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-3000}:80"
+    depends_on:
+      backend:
+        condition: service_healthy

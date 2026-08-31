@@ -1,0 +1,16 @@
+.env
+**/node_modules/
+**/dist/
+**/*.tsbuildinfo
+**/.expo/
+DATA/*
+!DATA/.gitkeep
+!DATA/files/
+DATA/files/*
+!DATA/files/.gitkeep
+!DATA/logs/
+DATA/logs/*
+!DATA/logs/.gitkeep
+!DATA/postgresql/
+DATA/postgresql/*
+coverage/
