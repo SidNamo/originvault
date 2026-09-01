@@ -1,0 +1,59 @@
+services:
+  postgres:
+    container_name: originvault-postgres
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-originvault}
+      POSTGRES_USER: ${POSTGRES_USER:-originvault}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    volumes:
+      - ./data/postgresql:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    container_name: originvault-backend
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
+      PORT: ${BACKEND_PORT:?BACKEND_PORT must be set}
+      BACKEND_BIND_ADDRESS: ${BACKEND_BIND_ADDRESS:?BACKEND_BIND_ADDRESS must be set}
+      BACKEND_HEALTHCHECK_HOST: ${BACKEND_HEALTHCHECK_HOST:?BACKEND_HEALTHCHECK_HOST must be set}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set}
+      SHARE_SECRET: ${SHARE_SECRET:?SHARE_SECRET must be set}
+      LEGACY_SHARE_SECRET: ${LEGACY_SHARE_SECRET:-}
+      PUBLIC_URL: ${PUBLIC_URL:?PUBLIC_URL must be set}
+      DATA_ROOT: /data/files
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-10737418240}
+      DEFAULT_STORAGE_QUOTA_BYTES: ${DEFAULT_STORAGE_QUOTA_BYTES:-10737418240}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_DIR: /data/logs
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-7}
+    volumes:
+      - ./data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('node:http').get({host:process.env.BACKEND_HEALTHCHECK_HOST,port:Number(process.env.PORT),path:'/api/health'},r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  frontend:
+    container_name: originvault-frontend
+    build: ./frontend
+    restart: unless-stopped
+    environment:
+      BACKEND_UPSTREAM: ${BACKEND_UPSTREAM:?BACKEND_UPSTREAM must be set}
+    ports:
+      - "${FRONTEND_BIND_ADDRESS:?FRONTEND_BIND_ADDRESS must be set}:${FRONTEND_PORT:?FRONTEND_PORT must be set}:80"
+    depends_on:
+      backend:
+        condition: service_healthy

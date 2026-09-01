@@ -1,0 +1,22 @@
+{
+  "expo": {
+    "name": "OriginVault",
+    "slug": "originvault",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.originvault.app"
+    },
+    "android": {
+      "package": "com.originvault.app"
+    },
+    "web": {
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-status-bar"
+    ]
+  }
+}
