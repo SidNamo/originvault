@@ -6,6 +6,7 @@ import { formatBytes } from "./format";
 import { PreviewViewer } from "./PreviewViewer";
 import { ListingControls, type ListingSortDirection, type ListingSortField, type ListingViewMode } from "./ListingControls";
 import { LazyFileThumbnail } from "./LazyFileThumbnail";
+import { useMarqueeSelection } from "./useMarqueeSelection";
 
 type TrashAction = { type: "file" | "folder"; id: string; name: string; root: boolean };
 const date = (value: string) => new Date(value).toLocaleString("ko-KR");
@@ -40,15 +41,10 @@ export function TrashPage({
   const [detailLoading, setDetailLoading] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; item: TrashAction }>();
   const contextMenuRef = useRef<HTMLDivElement>(null);
+  const surfaceRef = useRef<HTMLElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
-  const [selectionBox, setSelectionBox] = useState<{ left: number; top: number; width: number; height: number }>();
-  const [marqueeSelecting, setMarqueeSelecting] = useState(false);
   const selectionAnchor = useRef<string | undefined>(undefined);
-  const dragSelection = useRef<{ pointerId: number; startX: number; startY: number; base: Set<string>; dragging: boolean } | undefined>(undefined);
-  const suppressCardClick = useRef(false);
-  const selectedKeysRef = useRef(selectedKeys);
-  selectedKeysRef.current = selectedKeys;
 
   const loadRoot = async () => {
     setLoading(true);
@@ -189,72 +185,23 @@ export function TrashPage({
     });
     else setSelectedKeys(new Set([key]));
   };
-  useEffect(() => {
-    const surface = listRef.current?.closest<HTMLElement>("main");
-    if (!surface) return;
-    const pointerDown = (event: PointerEvent) => {
-      const target = event.target as HTMLElement;
-      if (event.pointerType === "touch" || event.button !== 0 || target.closest("button, a, input, select, textarea, label, [contenteditable='true'], [role='dialog'], .item-context-menu, .preview-backdrop, .drawer-backdrop")) return;
-      dragSelection.current = {
-        pointerId: event.pointerId,
-        startX: event.clientX,
-        startY: event.clientY,
-        base: event.ctrlKey || event.metaKey ? new Set(selectedKeysRef.current) : new Set(),
-        dragging: false,
-      };
-      setMarqueeSelecting(true);
-    };
-    const pointerMove = (event: PointerEvent) => {
-      const drag = dragSelection.current;
-      const list = listRef.current;
-      if (!drag || drag.pointerId !== event.pointerId || !list) return;
-      if (!drag.dragging && Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 5) return;
-      if (!drag.dragging) {
-        drag.dragging = true;
-        surface.setPointerCapture(event.pointerId);
-      }
-      event.preventDefault();
-      const left = Math.min(drag.startX, event.clientX);
-      const top = Math.min(drag.startY, event.clientY);
-      const right = Math.max(drag.startX, event.clientX);
-      const bottom = Math.max(drag.startY, event.clientY);
-      setSelectionBox({ left, top, width: right - left, height: bottom - top });
-      const hits = new Set(drag.base);
-      list.querySelectorAll<HTMLElement>("[data-trash-select-key]").forEach((card) => {
-        const rect = card.getBoundingClientRect();
-        if (rect.left < right && rect.right > left && rect.top < bottom && rect.bottom > top)
-          hits.add(card.dataset.trashSelectKey!);
-      });
-      setSelectedKeys(hits);
-    };
-    const finish = (event: PointerEvent, cancelled = false) => {
-      const drag = dragSelection.current;
-      if (!drag || drag.pointerId !== event.pointerId) return;
-      if (drag.dragging) {
-        suppressCardClick.current = true;
-        window.setTimeout(() => { suppressCardClick.current = false; }, 0);
-      } else if (!cancelled && !(event.target as HTMLElement).closest("[data-trash-select-key]")) {
-        setSelectedKeys(new Set());
-        selectionAnchor.current = undefined;
-      }
-      setSelectionBox(undefined);
-      setMarqueeSelecting(false);
-      dragSelection.current = undefined;
-      if (surface.hasPointerCapture(event.pointerId)) surface.releasePointerCapture(event.pointerId);
-    };
-    const pointerUp = (event: PointerEvent) => finish(event);
-    const pointerCancel = (event: PointerEvent) => finish(event, true);
-    surface.addEventListener("pointerdown", pointerDown);
-    surface.addEventListener("pointermove", pointerMove);
-    surface.addEventListener("pointerup", pointerUp);
-    surface.addEventListener("pointercancel", pointerCancel);
-    return () => {
-      surface.removeEventListener("pointerdown", pointerDown);
-      surface.removeEventListener("pointermove", pointerMove);
-      surface.removeEventListener("pointerup", pointerUp);
-      surface.removeEventListener("pointercancel", pointerCancel);
-    };
-  }, []);
+  const {
+    active: marqueeSelecting,
+    boxRef: selectionBoxRef,
+    suppressClickRef: suppressCardClick,
+  } = useMarqueeSelection({
+    surfaceRef,
+    itemsRef: listRef,
+    itemSelector: "[data-trash-select-key]",
+    itemDataAttribute: "data-trash-select-key",
+    enabled: true,
+    selectedKeys,
+    setSelectedKeys,
+    onClear: () => {
+      setSelectedKeys(new Set());
+      selectionAnchor.current = undefined;
+    },
+  });
   const restoreItem = async (item: TrashAction, collision?: "overwrite" | "rename") => {
     setBusy(`restore:${item.id}`);
     try {
@@ -344,7 +291,7 @@ export function TrashPage({
   };
   const folder = contents?.folder;
   return (
-    <section className="workspace-page trash-page">
+    <section ref={surfaceRef} className="workspace-page trash-page">
       <header className="page-hero">
         <div>
           <p className="eyebrow">RECOVERY</p>
@@ -381,7 +328,7 @@ export function TrashPage({
         <div className="bulk-actions"><button className="bulk-danger" disabled={!selections.length || Boolean(busy)} onClick={() => void permanentlyDeleteSelected()}><Trash2 />선택 즉시 삭제</button></div>
       </div>
       <div ref={listRef} className={`panel-card trash-list view-${viewMode} ${marqueeSelecting ? "marquee-selecting" : ""}`}>
-        {selectionBox && <div className="selection-box main-selection-box" style={selectionBox} />}
+        <div ref={selectionBoxRef} className={`selection-box main-selection-box marquee-selection-box ${marqueeSelecting ? "active" : ""}`} />
         {loading ? <div className="trash-empty">휴지통을 불러오는 중입니다.</div> : folder ? (
           !contents?.folders.length && !contents?.files.length ? <div className="trash-empty"><div className="trash-empty-icon"><FolderOpen /></div><h2>이 폴더는 비어 있습니다</h2><p>삭제된 항목이 있으면 이곳에서 확인하고 복원할 수 있습니다.</p></div> : <>
             {sortedFolders.map((item) => {
@@ -398,7 +345,7 @@ export function TrashPage({
               const key = actionKey(action);
               const Icon = item.mimeType.startsWith("image/") ? FileImage : item.mimeType.startsWith("video/") ? FileVideo : File;
               return <article data-trash-select-key={key} className={`trash-item ${selectedKeys.has(key) ? "selected" : ""}`} key={`file:${item.id}`} onClick={(event) => handleCardClick(key, event)} onDoubleClick={() => openPreview(item)} onContextMenu={(event) => showMenu(event, action)}>
-                {viewMode === "preview" ? <LazyFileThumbnail fileId={item.id} version={item.sha256} kind={item.mimeType.startsWith("image/") ? "image" : item.mimeType.startsWith("video/") ? "video" : "unsupported"} source="trash" fallback={Icon} /> : <div className="trash-kind"><Icon /></div>}
+                {viewMode === "preview" ? <LazyFileThumbnail fileId={item.id} fileName={item.name} mimeType={item.mimeType} version={item.sha256} kind={item.mimeType.startsWith("image/") ? "image" : item.mimeType.startsWith("video/") ? "video" : "unsupported"} source="trash" fallback={Icon} /> : <div className="trash-kind"><Icon /></div>}
                 <div className="trash-item-main"><strong>{item.name}</strong><small>{formatBytes(item.sizeBytes)} · 파일 미리보기</small></div>
                 <button className="icon-action" title="메뉴" onClick={(event) => showMenu(event, action)}><MoreHorizontal /></button>
               </article>;
@@ -411,7 +358,7 @@ export function TrashPage({
           return <article data-trash-select-key={key} className={`trash-item ${selectedKeys.has(key) ? "selected" : ""}`} key={`${item.type}:${item.id}`} onClick={(event) => handleCardClick(key, event)} onDoubleClick={() => item.type === "folder"
             ? openFolder({ id: item.id, name: item.name, parentId: null, createdAt: item.trashedAt, modifiedAt: item.trashedAt, trashedAt: item.trashedAt })
             : openPreview(item)} onContextMenu={(event) => showMenu(event, action)}>
-            {viewMode === "preview" ? item.type === "folder" ? <div className="file-preview-thumb folder-thumb" aria-hidden="true"><Folder /></div> : <LazyFileThumbnail fileId={item.id} version={item.id} kind={item.mimeType?.startsWith("image/") ? "image" : item.mimeType?.startsWith("video/") ? "video" : "unsupported"} source="trash" fallback={Icon} /> : <div className="trash-kind"><Icon /></div>}
+            {viewMode === "preview" ? item.type === "folder" ? <div className="file-preview-thumb folder-thumb" aria-hidden="true"><Folder /></div> : <LazyFileThumbnail fileId={item.id} fileName={item.name} mimeType={item.mimeType ?? undefined} version={item.id} kind={item.mimeType?.startsWith("image/") ? "image" : item.mimeType?.startsWith("video/") ? "video" : "unsupported"} source="trash" fallback={Icon} /> : <div className="trash-kind"><Icon /></div>}
             <div className="trash-item-main">
               <strong>{item.name}</strong>
               <small>{item.type === "folder" ? `파일 ${item.fileCount.toLocaleString("ko-KR")}개 · 폴더 ${Math.max(0, item.folderCount - 1).toLocaleString("ko-KR")}개` : "파일"}{` · ${formatBytes(item.sizeBytes)}`}</small>

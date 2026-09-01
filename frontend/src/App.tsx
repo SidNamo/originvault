@@ -66,6 +66,7 @@ import { CollisionDialog } from "./CollisionDialog";
 import { ListingControls, type ListingSortDirection, type ListingSortField, type ListingViewMode } from "./ListingControls";
 import { LazyFileThumbnail } from "./LazyFileThumbnail";
 import { beginClipboardCopy, copyText } from "./clipboard";
+import { useMarqueeSelection } from "./useMarqueeSelection";
 const UPLOAD_CHUNK_BYTES = 5 * 1024 * 1024;
 const HASH_CHUNK_BYTES = 8 * 1024 * 1024;
 const HASH_CONCURRENCY = 2;
@@ -428,12 +429,6 @@ function Dashboard({
   );
   const [uploadBatch, setUploadBatch] = useState(0);
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
-  const [selectionBox, setSelectionBox] = useState<{
-    left: number;
-    top: number;
-    width: number;
-    height: number;
-  }>();
   const [moveOpen, setMoveOpen] = useState(false);
   const [moveDestination, setMoveDestination] = useState("");
   const [shareDialogTarget, setShareDialogTarget] = useState<{
@@ -497,18 +492,7 @@ function Dashboard({
   const folderDetailRequestSequence = useRef(0);
   const selectionAnchor = useRef<string | undefined>(undefined);
   const draggedSelections = useRef<BulkSelection[]>([]);
-  const dragSelection = useRef<
-    | {
-        pointerId: number;
-        startX: number;
-        startY: number;
-        base: Set<string>;
-        dragging: boolean;
-      }
-    | undefined
-  >(undefined);
   const externalDragDepth = useRef(0);
-  const suppressCardClick = useRef(false);
   const collisionDecisions = useRef(new Map<string, CollisionChoice>());
   const collisionResolver = useRef<
     ((decisions: Map<string, CollisionChoice>) => void) | undefined
@@ -868,7 +852,11 @@ function Dashboard({
           });
         })
         .catch((error) => {
-          if (error instanceof DOMException && error.name === "AbortError")
+          if (
+            error instanceof DOMException &&
+            error.name === "AbortError" &&
+            cancelledUploadTasks.current.has(id)
+          )
             return;
           setUploadTasks((previous) =>
             previous.map((entry) =>
@@ -877,7 +865,9 @@ function Dashboard({
                     ...entry,
                     status: "failed",
                     error:
-                      error instanceof Error ? error.message : "파일 검증 실패",
+                      error instanceof Error
+                        ? `파일 SHA-256 검증 실패: ${error.message}`
+                        : "파일 SHA-256 검증에 실패했습니다.",
                   }
                 : entry,
             ),
@@ -1154,18 +1144,92 @@ function Dashboard({
       previous.filter((task) => !removeIds.has(task.id)),
     );
   };
-  const retryUpload = (id: string) =>
+  const retryUpload = (id: string) => {
+    const task = uploadTasks.find((entry) => entry.id === id);
+    if (!task || hashingTasks.current.has(id)) return;
+    cancelledUploadTasks.current.delete(id);
+    pausedUploadTasks.current.delete(id);
+    if (!task.file) {
+      setUploadTasks((previous) =>
+        previous.map((entry) =>
+          entry.id === id
+            ? { ...entry, status: "paused", error: undefined }
+            : entry,
+        ),
+      );
+      return;
+    }
+    if (task.contentSha256) {
+      setUploadTasks((previous) =>
+        previous.map((entry) =>
+          entry.id === id
+            ? { ...entry, status: "queued", error: undefined }
+            : entry,
+        ),
+      );
+      return;
+    }
+
     setUploadTasks((previous) =>
-      previous.map((task) =>
-        task.id === id
-          ? {
-              ...task,
-              status: task.file ? "queued" : "paused",
-              error: undefined,
-            }
-          : task,
+      previous.map((entry) =>
+        entry.id === id
+          ? { ...entry, status: "preparing", progress: 0, error: undefined }
+          : entry,
       ),
     );
+    hashingTasks.current.add(id);
+    void runHashLimited(() =>
+      hashFile(
+        task.file!,
+        () => cancelledUploadTasks.current.has(id),
+        (progress) =>
+          setUploadTasks((previous) =>
+            previous.map((entry) =>
+              entry.id === id ? { ...entry, progress } : entry,
+            ),
+          ),
+      ),
+    )
+      .then((contentSha256) =>
+        setUploadTasks((previous) =>
+          previous.map((entry) =>
+            entry.id === id
+              ? {
+                  ...entry,
+                  contentSha256,
+                  status: pausedUploadTasks.current.has(id)
+                    ? "paused"
+                    : "queued",
+                  progress: 0,
+                }
+              : entry,
+          ),
+        ),
+      )
+      .catch((error) => {
+        if (
+          error instanceof DOMException &&
+          error.name === "AbortError" &&
+          cancelledUploadTasks.current.has(id)
+        )
+          return;
+        setUploadTasks((previous) =>
+          previous.map((entry) =>
+            entry.id === id
+              ? {
+                  ...entry,
+                  status: "failed",
+                  error:
+                    error instanceof Error
+                      ? `파일 SHA-256 검증 실패: ${error.message}`
+                      : "파일 SHA-256 검증에 실패했습니다.",
+                }
+              : entry,
+          ),
+        );
+      })
+      .finally(() => hashingTasks.current.delete(id));
+  };
   const pauseAllUploads = () => {
     const active = uploadTasks.filter((task) =>
       task.status === "preparing" ||
@@ -1480,6 +1544,20 @@ function Dashboard({
     selectionAnchor.current = undefined;
     setSelectedKeys(new Set());
   };
+  const {
+    active: marqueeSelecting,
+    boxRef: selectionBoxRef,
+    suppressClickRef: suppressCardClick,
+  } = useMarqueeSelection({
+    surfaceRef: contentRef,
+    itemsRef: filesSection,
+    itemSelector: "[data-select-key]",
+    itemDataAttribute: "data-select-key",
+    enabled: activeView === "files",
+    selectedKeys,
+    setSelectedKeys,
+    onClear: clearSelection,
+  });
   const storeFileClipboard = (
     mode: FileClipboard["mode"],
     selected: BulkSelection[] = selections,
@@ -1523,93 +1601,6 @@ function Dashboard({
       );
       return remaining.length ? { ...current, selections: remaining } : undefined;
     });
-  };
-  const handleSelectionPointerDown = (
-    event: React.PointerEvent<HTMLElement>,
-  ) => {
-    const target = event.target as HTMLElement;
-    if (
-      activeView !== "files" ||
-      event.pointerType === "touch" ||
-      event.button !== 0 ||
-      target.closest(
-        "button, a, input, select, textarea, label, [contenteditable='true'], [role='dialog'], .item-context-menu, .preview-backdrop, .drawer-backdrop",
-      )
-    )
-      return;
-    dragSelection.current = {
-      pointerId: event.pointerId,
-      startX: event.clientX,
-      startY: event.clientY,
-      base: event.ctrlKey || event.metaKey ? new Set(selectedKeys) : new Set(),
-      dragging: false,
-    };
-  };
-  const handleSelectionPointerMove = (
-    event: React.PointerEvent<HTMLElement>,
-  ) => {
-    const drag = dragSelection.current;
-    const section = filesSection.current;
-    if (!drag || drag.pointerId !== event.pointerId || !section) return;
-    if (
-      !drag.dragging &&
-      Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 5
-    )
-      return;
-    if (!drag.dragging) {
-      drag.dragging = true;
-      event.currentTarget.setPointerCapture(event.pointerId);
-    }
-    event.preventDefault();
-    const left = Math.min(drag.startX, event.clientX),
-      top = Math.min(drag.startY, event.clientY),
-      right = Math.max(drag.startX, event.clientX),
-      bottom = Math.max(drag.startY, event.clientY);
-    setSelectionBox({
-      left,
-      top,
-      width: right - left,
-      height: bottom - top,
-    });
-    const hits = new Set(drag.base);
-    section
-      .querySelectorAll<HTMLElement>("[data-select-key]")
-      .forEach((card) => {
-        const rect = card.getBoundingClientRect();
-        if (
-          rect.left < right &&
-          rect.right > left &&
-          rect.top < bottom &&
-          rect.bottom > top
-        )
-          hits.add(card.dataset.selectKey!);
-      });
-    setSelectedKeys(hits);
-  };
-  const handleSelectionPointerUp = (event: React.PointerEvent<HTMLElement>) => {
-    const drag = dragSelection.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    if (drag.dragging) {
-      suppressCardClick.current = true;
-      window.setTimeout(() => {
-        suppressCardClick.current = false;
-      }, 0);
-    } else if (!(event.target as HTMLElement).closest("[data-select-key]"))
-      clearSelection();
-    setSelectionBox(undefined);
-    dragSelection.current = undefined;
-    if (event.currentTarget.hasPointerCapture(event.pointerId))
-      event.currentTarget.releasePointerCapture(event.pointerId);
-  };
-  const handleSelectionPointerCancel = (
-    event: React.PointerEvent<HTMLElement>,
-  ) => {
-    const drag = dragSelection.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    setSelectionBox(undefined);
-    dragSelection.current = undefined;
-    if (event.currentTarget.hasPointerCapture(event.pointerId))
-      event.currentTarget.releasePointerCapture(event.pointerId);
   };
   const downloadOriginals = async () => {
     try {
@@ -2296,10 +2287,6 @@ function Dashboard({
       <main
         ref={contentRef}
         className="content"
-        onPointerDown={handleSelectionPointerDown}
-        onPointerMove={handleSelectionPointerMove}
-        onPointerUp={handleSelectionPointerUp}
-        onPointerCancel={handleSelectionPointerCancel}
       >
         <div className="global-notice-stack" aria-live="polite" aria-relevant="additions removals">
           {notices.map((notice) => (
@@ -2426,9 +2413,10 @@ function Dashboard({
               onDragLeave={(event) => clearDropTarget(event, "current")}
               onDrop={(event) => handleDropAt(event, folder)}
             >
-              {selectionBox && (
-                <div className="selection-box main-selection-box" style={selectionBox} />
-              )}{" "}
+              <div
+                ref={selectionBoxRef}
+                className={`selection-box main-selection-box marquee-selection-box ${marqueeSelecting ? "active" : ""}`}
+              />{" "}
               {!items.folders.length && !items.files.length && !folder ? (
                 <div
                   className={`empty ${dropTarget === "current" ? "drop-target" : ""}`}
@@ -2606,6 +2594,8 @@ function Dashboard({
                         {viewMode === "preview" ? (
                           <LazyFileThumbnail
                             fileId={item.id}
+                            fileName={item.name}
+                            mimeType={item.mimeType}
                             version={item.sha256}
                             kind={item.mimeType.startsWith("image/") ? "image" : item.mimeType.startsWith("video/") ? "video" : "unsupported"}
                             source="files"

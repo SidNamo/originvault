@@ -1159,8 +1159,7 @@ svg {
   color: #5b45a4;
 }
 
-.queue-remove,
-.queue-retry {
+.queue-remove {
   width: 27px;
   height: 27px;
   border: 0;
@@ -1172,18 +1171,35 @@ svg {
   padding: 0;
 }
 
+.queue-retry,
+.queue-error-detail {
+  min-height: 27px;
+  padding: 0 7px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 9px;
+  white-space: nowrap;
+}
+
 .queue-remove:hover {
   background: var(--danger-soft);
   color: var(--danger);
 }
 
-.queue-retry:hover {
+.queue-retry:hover,
+.queue-error-detail:hover {
   background: var(--accent-soft);
   color: var(--accent);
 }
 
 .queue-remove svg,
-.queue-retry svg {
+.queue-retry svg,
+.queue-error-detail svg {
   width: 13px;
 }
 
@@ -1192,7 +1208,7 @@ svg {
   padding: 6px 11px 6px 19px;
   border-top: 1px solid #edede9;
   display: grid;
-  grid-template-columns: 27px minmax(0, 1fr) 45px 27px 27px;
+  grid-template-columns: 27px minmax(0, 1fr) 45px auto;
   align-items: center;
   gap: 7px;
 }
@@ -1223,8 +1239,53 @@ svg {
   font-size: 9px;
 }
 
-.upload-row:not(:has(.queue-retry)) .queue-remove {
-  grid-column: 5;
+.task-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 3px;
+}
+
+.modal-backdrop.upload-error-backdrop {
+  z-index: 130;
+}
+
+.modal-icon.upload-error-icon {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.upload-error-file {
+  margin: 18px 0 9px;
+  padding: 10px;
+  display: grid;
+  gap: 3px;
+  background: var(--surface-soft);
+  border-radius: var(--radius);
+}
+
+.upload-error-file strong {
+  overflow-wrap: anywhere;
+  font-size: 12px;
+}
+
+.upload-error-file span {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.upload-error-dialog pre {
+  max-height: 240px;
+  margin: 0 0 18px;
+  padding: 12px;
+  overflow: auto;
+  border: 1px solid #edc5c5;
+  border-radius: var(--radius);
+  background: #fff8f8;
+  color: #7e2727;
+  font: 11px/1.6 ui-monospace, SFMono-Regular, Consolas, monospace;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 
 /* Trash */
@@ -2018,6 +2079,17 @@ svg {
 .selection-box.main-selection-box {
   position: fixed;
   z-index: 95;
+}
+
+.selection-box.marquee-selection-box {
+  left: 0;
+  top: 0;
+  display: none;
+  will-change: transform, width, height;
+}
+
+.selection-box.marquee-selection-box.active {
+  display: block;
 }
 
 /* Context menu */
@@ -4775,7 +4847,7 @@ svg {
 
   .upload-row {
     padding-left: 10px;
-    grid-template-columns: 26px minmax(0, 1fr) 39px 26px 26px;
+    grid-template-columns: 26px minmax(0, 1fr) 39px auto;
   }
 
   .share-layout,

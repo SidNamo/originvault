@@ -1,5 +1,6 @@
-import { useEffect, useLayoutEffect, useRef, useState, type ComponentType } from "react";
+import { useEffect, useRef, useState, type ComponentType } from "react";
 import { api } from "./api";
+import { usePausableImage } from "./usePausableImage";
 
 type ThumbnailSource = "files" | "trash" | "public";
 const visibilityListeners = new Map<Element, (visible: boolean) => void>();
@@ -31,6 +32,8 @@ function observeNearViewport(element: Element, listener: (visible: boolean) => v
 
 export function LazyFileThumbnail({
   fileId,
+  fileName,
+  mimeType,
   version,
   kind,
   source,
@@ -38,6 +41,8 @@ export function LazyFileThumbnail({
   fallback: Fallback,
 }: {
   fileId: string;
+  fileName: string;
+  mimeType?: string;
   version: string;
   kind: "image" | "video" | "unsupported";
   source: ThumbnailSource;
@@ -45,13 +50,21 @@ export function LazyFileThumbnail({
   fallback: ComponentType<{ size?: number }>;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const imageRef = useRef<HTMLImageElement>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
   const [nearViewport, setNearViewport] = useState(false);
   const [ticket, setTicket] = useState<{ key: string; url: string }>();
   const resourceKey = `${source}:${shareToken ?? ""}:${fileId}:${version}`;
   const previewUrl = ticket?.key === resourceKey ? ticket.url : "";
   const previewable = kind === "image" || kind === "video";
+  const nativeOnlyImage = kind === "image" && (
+    mimeType?.split(";", 1)[0]?.trim().toLowerCase() === "image/svg+xml" ||
+    /\.svgz?$/i.test(fileName)
+  );
+  const imageUrl = usePausableImage({
+    active: nearViewport,
+    enabled: kind === "image" && !nativeOnlyImage,
+    resourceKey,
+    url: previewUrl || undefined,
+  });
 
   useEffect(() => {
     const element = containerRef.current;
@@ -77,23 +90,14 @@ export function LazyFileThumbnail({
     return () => controller.abort();
   }, [fileId, nearViewport, previewUrl, previewable, resourceKey, shareToken, source, version]);
 
-  useLayoutEffect(() => {
-    if (!nearViewport || !previewUrl) return;
-    return () => {
-      const media = imageRef.current ?? videoRef.current;
-      if (!media) return;
-      media.removeAttribute("src");
-      if (media.tagName === "VIDEO") (media as HTMLVideoElement).load();
-    };
-  }, [nearViewport, previewUrl]);
-
-  const activeUrl = nearViewport ? previewUrl : undefined;
+  const nativeImageUrl = nativeOnlyImage ? previewUrl : undefined;
+  const videoUrl = nearViewport && kind === "video" ? previewUrl : undefined;
   return (
     <div ref={containerRef} className="file-preview-thumb" aria-hidden="true">
-      {activeUrl && kind === "image" ? (
-        <img ref={imageRef} src={activeUrl} alt="" />
-      ) : activeUrl && kind === "video" ? (
-        <video ref={videoRef} src={activeUrl} muted playsInline preload="metadata" />
+      {(imageUrl || nativeImageUrl) && kind === "image" ? (
+        <img src={imageUrl || nativeImageUrl} alt="" />
+      ) : videoUrl ? (
+        <video src={videoUrl} muted playsInline preload="metadata" />
       ) : (
         <Fallback size={36} />
       )}

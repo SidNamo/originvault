@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronDown,
   ChevronUp,
@@ -6,6 +6,7 @@ import {
   CircleX,
   File,
   Folder,
+  Info,
   LoaderCircle,
   Pause,
   Play,
@@ -92,6 +93,8 @@ export function UploadQueue({
   const [filter, setFilter] = useState<Filter>("all");
   const [collapsed, setCollapsed] = useState(true);
   const [hidden, setHidden] = useState(false);
+  const [errorTaskId, setErrorTaskId] = useState<string>();
+  const previousFailedCount = useRef(0);
   useEffect(() => {
     if (batch) {
       setCollapsed(true);
@@ -109,6 +112,27 @@ export function UploadQueue({
     }),
     [tasks],
   );
+  const errorTask = tasks.find((task) => task.id === errorTaskId);
+  useEffect(() => {
+    if (counts.failed > previousFailedCount.current) {
+      setCollapsed(false);
+      setHidden(false);
+      setFilter("failed");
+    }
+    previousFailedCount.current = counts.failed;
+  }, [counts.failed]);
+  useEffect(() => {
+    if (!errorTaskId) return;
+    if (!errorTask) {
+      setErrorTaskId(undefined);
+      return;
+    }
+    const close = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setErrorTaskId(undefined);
+    };
+    document.addEventListener("keydown", close);
+    return () => document.removeEventListener("keydown", close);
+  }, [errorTask, errorTaskId]);
   const totalBytes = tasks.reduce((sum, task) => sum + task.sizeBytes, 0);
   const completedBytes = tasks.reduce(
     (sum, task) => sum + taskProgressBytes(task),
@@ -152,6 +176,7 @@ export function UploadQueue({
       </button>
     );
   return (
+    <>
     <section className={`upload-panel ${collapsed ? "collapsed" : ""}`} role="dialog" aria-label="업로드 상태">
       <div className="upload-panel-head">
         <div>
@@ -176,7 +201,7 @@ export function UploadQueue({
           >
             {collapsed ? <ChevronUp /> : <ChevronDown />}
           </button>
-          <button className="upload-panel-toggle" aria-label="업로드 상태 숨기기" onClick={() => setHidden(true)}>
+          <button className="upload-panel-toggle" aria-label="업로드 상태 숨기기" onClick={() => { setErrorTaskId(undefined); setHidden(true); }}>
             <X />
           </button>
         </div>
@@ -310,7 +335,7 @@ export function UploadQueue({
                       </div>
                       <div className="task-info">
                         <strong title={task.fileName}>{task.fileName}</strong>
-                        <small>
+                        <small title={task.error}>
                           {task.status === "preparing"
                             ? "이어받기 무결성을 위해 파일 SHA-256을 계산하고 있습니다."
                             : task.status === "paused"
@@ -331,28 +356,35 @@ export function UploadQueue({
                             ? "중단"
                             : task.status === "preparing"
                               ? `검증 ${task.progress}%`
-                              : `${task.progress}%`}
+                               : `${task.progress}%`}
                       </span>
-                      {task.status === "failed" && (
+                      <div className="task-actions">
+                        {task.status === "failed" && (<>
+                          <button
+                            className="queue-error-detail"
+                            onClick={() => setErrorTaskId(task.id)}
+                          >
+                            <Info />오류 보기
+                          </button>
+                          <button
+                            className="queue-retry"
+                            onClick={() => onRetry(task.id)}
+                          >
+                            <RefreshCw />재업로드
+                          </button>
+                        </>)}
                         <button
-                          className="queue-retry"
-                          title="다시 시도"
-                          onClick={() => onRetry(task.id)}
+                          className="queue-remove"
+                          title={
+                            task.status === "uploading"
+                              ? "업로드 취소"
+                              : "목록에서 삭제"
+                          }
+                          onClick={() => onRemove([task.id])}
                         >
-                          <RefreshCw />
+                          <Trash2 />
                         </button>
-                      )}
-                      <button
-                        className="queue-remove"
-                        title={
-                          task.status === "uploading"
-                            ? "업로드 취소"
-                            : "목록에서 삭제"
-                        }
-                        onClick={() => onRemove([task.id])}
-                      >
-                        <Trash2 />
-                      </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -362,5 +394,41 @@ export function UploadQueue({
         </>
       )}
     </section>
+    {errorTask && (
+      <div
+        className="modal-backdrop upload-error-backdrop"
+        role="presentation"
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setErrorTaskId(undefined);
+        }}
+      >
+        <section
+          className="move-dialog upload-error-dialog"
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="upload-error-title"
+          aria-describedby="upload-error-message"
+        >
+          <header>
+            <div className="modal-icon upload-error-icon"><CircleX /></div>
+            <div>
+              <p className="eyebrow">UPLOAD FAILED</p>
+              <h2 id="upload-error-title">업로드 오류</h2>
+            </div>
+            <button className="icon-btn" aria-label="오류 닫기" onClick={() => setErrorTaskId(undefined)}><X /></button>
+          </header>
+          <div className="upload-error-file">
+            <strong>{errorTask.fileName}</strong>
+            <span>{errorTask.destinationLabel}</span>
+          </div>
+          <pre id="upload-error-message">{errorTask.error ?? "알 수 없는 업로드 오류가 발생했습니다."}</pre>
+          <footer>
+            <button className="secondary" onClick={() => setErrorTaskId(undefined)}>닫기</button>
+            <button className="primary" onClick={() => { setErrorTaskId(undefined); onRetry(errorTask.id); }}><RefreshCw />재업로드</button>
+          </footer>
+        </section>
+      </div>
+    )}
+    </>
   );
 }

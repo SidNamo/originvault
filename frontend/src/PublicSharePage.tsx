@@ -29,6 +29,7 @@ import { formatBytes } from "./format";
 import { PublicPreviewViewer } from "./PublicPreviewViewer";
 import { ListingControls, type ListingSortDirection, type ListingSortField, type ListingViewMode } from "./ListingControls";
 import { LazyFileThumbnail } from "./LazyFileThumbnail";
+import { useMarqueeSelection } from "./useMarqueeSelection";
 
 type PublicItem =
   | { type: "file"; item: PublicShareFile }
@@ -57,13 +58,6 @@ export function PublicSharePage({ token }: { token: string }) {
     return saved === "details" || saved === "grid-2" || saved === "grid-3" || saved === "preview" ? saved : "details";
   });
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
-  const [selectionBox, setSelectionBox] = useState<{
-    left: number;
-    top: number;
-    width: number;
-    height: number;
-  }>();
-  const [marqueeSelecting, setMarqueeSelecting] = useState(false);
   const [contextMenu, setContextMenu] = useState<{
     x: number;
     y: number;
@@ -75,21 +69,11 @@ export function PublicSharePage({ token }: { token: string }) {
   const [detail, setDetail] = useState<PublicDetail>();
   const [detailLoading, setDetailLoading] = useState(false);
   const [previewFile, setPreviewFile] = useState<PublicShareFile>();
+  const surfaceRef = useRef<HTMLElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
   const contextMenuRef = useRef<HTMLDivElement>(null);
   const pickerRef = useRef<HTMLInputElement>(null);
   const selectionAnchor = useRef<string | undefined>(undefined);
-  const dragSelection = useRef<
-    | {
-        pointerId: number;
-        startX: number;
-        startY: number;
-        base: Set<string>;
-        dragging: boolean;
-      }
-    | undefined
-  >(undefined);
-  const suppressCardClick = useRef(false);
 
   const folders = share?.folders ?? [];
   const files = share?.files ?? (share?.file ? [share.file] : []);
@@ -244,77 +228,23 @@ export function PublicSharePage({ token }: { token: string }) {
       });
     else setSelectedKeys(new Set([key]));
   };
-  const handlePointerDown = (event: React.PointerEvent<HTMLElement>) => {
-    const target = event.target as HTMLElement;
-    if (
-      share?.type !== "folder" ||
-      event.pointerType === "touch" ||
-      event.button !== 0 ||
-      target.closest("button, a, input, select, textarea, label, [contenteditable='true'], [role='dialog'], .item-context-menu, .preview-backdrop, .drawer-backdrop")
-    )
-      return;
-    dragSelection.current = {
-      pointerId: event.pointerId,
-      startX: event.clientX,
-      startY: event.clientY,
-      base: event.ctrlKey || event.metaKey ? new Set(selectedKeys) : new Set(),
-      dragging: false,
-    };
-    setMarqueeSelecting(true);
-  };
-  const handlePointerMove = (event: React.PointerEvent<HTMLElement>) => {
-    const drag = dragSelection.current;
-    const grid = gridRef.current;
-    if (!drag || drag.pointerId !== event.pointerId || !grid) return;
-    if (
-      !drag.dragging &&
-      Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 5
-    )
-      return;
-    if (!drag.dragging) {
-      drag.dragging = true;
-      event.currentTarget.setPointerCapture(event.pointerId);
-    }
-    event.preventDefault();
-    const left = Math.min(drag.startX, event.clientX);
-    const top = Math.min(drag.startY, event.clientY);
-    const right = Math.max(drag.startX, event.clientX);
-    const bottom = Math.max(drag.startY, event.clientY);
-    setSelectionBox({
-      left,
-      top,
-      width: right - left,
-      height: bottom - top,
-    });
-    const hits = new Set(drag.base);
-    grid.querySelectorAll<HTMLElement>("[data-public-select-key]").forEach((card) => {
-      const rect = card.getBoundingClientRect();
-      if (rect.left < right && rect.right > left && rect.top < bottom && rect.bottom > top)
-        hits.add(card.dataset.publicSelectKey!);
-    });
-    setSelectedKeys(hits);
-  };
-  const finishPointer = (event: React.PointerEvent<HTMLElement>) => {
-    const drag = dragSelection.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    if (drag.dragging) {
-      suppressCardClick.current = true;
-      window.setTimeout(() => { suppressCardClick.current = false; }, 0);
-    } else if (!(event.target as HTMLElement).closest("[data-public-select-key]")) {
+  const {
+    active: marqueeSelecting,
+    boxRef: selectionBoxRef,
+    suppressClickRef: suppressCardClick,
+  } = useMarqueeSelection({
+    surfaceRef,
+    itemsRef: gridRef,
+    itemSelector: "[data-public-select-key]",
+    itemDataAttribute: "data-public-select-key",
+    enabled: share?.type === "folder",
+    selectedKeys,
+    setSelectedKeys,
+    onClear: () => {
       setSelectedKeys(new Set());
       selectionAnchor.current = undefined;
-    }
-    setSelectionBox(undefined);
-    setMarqueeSelecting(false);
-    dragSelection.current = undefined;
-    if (event.currentTarget.hasPointerCapture(event.pointerId))
-      event.currentTarget.releasePointerCapture(event.pointerId);
-  };
-  const finishSelectionGesture = (event: React.PointerEvent<HTMLElement>) => {
-    finishPointer(event);
-    if (event.currentTarget.hasPointerCapture(event.pointerId))
-      event.currentTarget.releasePointerCapture(event.pointerId);
-  };
+    },
+  });
   const showItemMenu = (event: React.MouseEvent<HTMLElement>, item: PublicItem) => {
     event.preventDefault();
     event.stopPropagation();
@@ -398,13 +328,10 @@ export function PublicSharePage({ token }: { token: string }) {
 
   return (
     <main
+      ref={surfaceRef}
       className="public-share-shell"
-      onPointerDown={handlePointerDown}
-      onPointerMove={handlePointerMove}
-      onPointerUp={finishSelectionGesture}
-      onPointerCancel={finishSelectionGesture}
     >
-      {selectionBox && <div className="selection-box main-selection-box" style={selectionBox} />}
+      <div ref={selectionBoxRef} className={`selection-box main-selection-box marquee-selection-box ${marqueeSelecting ? "active" : ""}`} />
       <header>
         <div className="public-brand">
           <div className="logo"><Archive /></div>
@@ -486,7 +413,7 @@ export function PublicSharePage({ token }: { token: string }) {
                     const selected = selectedKeys.has(key);
                     const Icon = file.kind === "image" ? FileImage : file.kind === "video" ? FileVideo : File;
                     return <article data-public-select-key={key} className={`public-item ${selected ? "selected" : ""}`} key={file.id} onClick={(event) => handleCardClick(key, event)} onDoubleClick={() => setPreviewFile(file)} onContextMenu={(event) => showItemMenu(event, { type: "file", item: file })}>
-                      {viewMode === "preview" ? <LazyFileThumbnail fileId={file.id} version={file.sha256} kind={file.kind === "image" ? "image" : file.kind === "video" ? "video" : "unsupported"} source="public" shareToken={token} fallback={Icon} /> : <Icon />}<span><strong>{file.name}</strong><small>{formatBytes(file.sizeBytes)}</small></span>
+                      {viewMode === "preview" ? <LazyFileThumbnail fileId={file.id} fileName={file.name} mimeType={file.mimeType} version={file.sha256} kind={file.kind === "image" ? "image" : file.kind === "video" ? "video" : "unsupported"} source="public" shareToken={token} fallback={Icon} /> : <Icon />}<span><strong>{file.name}</strong><small>{formatBytes(file.sizeBytes)}</small></span>
                       <div className="public-item-actions"><button aria-label={`${file.name} 미리보기`} title="미리보기" onClick={(event) => { event.stopPropagation(); setPreviewFile(file); }}><Eye /></button><a aria-label={`${file.name} 원본 다운로드`} title="원본 다운로드" href={api.publicShareDownloadUrl(token, file.id)} onClick={(event) => event.stopPropagation()}><Download /></a><button aria-label={`${file.name} 메뉴`} title="메뉴" onClick={(event) => { event.stopPropagation(); setContextMenu({ x: event.clientX, y: event.clientY, item: { type: "file", item: file } }); }}><MoreHorizontal /></button></div>
                     </article>;
                   })}
