@@ -9,7 +9,7 @@ OriginVault는 개인 서버에서 운영하는 원본 파일 금고입니다. �
 ## 배포 구조
 
 운영 경로는 Nginx Proxy Manager(NPM) -> frontend -> backend -> PostgreSQL입니다.
-Compose는 `.env`의 bind 설정에 따라 frontend만 host에 공개합니다. backend와
+Compose는 frontend만 `.env`의 `FRONTEND_PORT`로 host에 공개합니다. backend와
 PostgreSQL은 host 포트를 열지 않으며 직접 외부에 공개하면 안 됩니다.
 
 NPM에서 TLS를 종료하고 Force SSL을 켜며, 외부 firewall/NAT에는 NPM의 HTTPS 포트만
@@ -17,11 +17,12 @@ NPM에서 TLS를 종료하고 Force SSL을 켜며, 외부 firewall/NAT에는 NPM
 
 | NPM 실행 위치 | upstream host | upstream port |
 | --- | --- | --- |
-| Host 프로세스 | `FRONTEND_BIND_ADDRESS` | `FRONTEND_PORT` |
+| Host 프로세스 | OriginVault host | `FRONTEND_PORT` |
 | Docker 컨테이너 | `originvault_default` 네트워크의 `frontend` | `80` |
 
 Docker NPM은 `originvault_default` 네트워크에 연결한 뒤 `frontend:80`을 upstream으로
-사용합니다. 브라우저 origin과 내부 upstream을 포함한 모든 주소는 `.env`에만 입력합니다.
+사용합니다. Docker 내부 backend와 PostgreSQL 주소는 Compose에서 고정하며 `.env`에는
+외부에서 선택해야 하는 값만 입력합니다.
 
 ## 환경 변수
 
@@ -36,16 +37,10 @@ Expo app의 API origin은 `app/.env.example`을 복사해 만든 `app/.env`의
 | `POSTGRES_DB` | 고정 | DB 이름. 최초 배포 뒤에는 변경하지 않습니다. |
 | `POSTGRES_USER` | 고정 | DB 로그인 이름. 최초 배포 뒤에는 변경하지 않습니다. |
 | `POSTGRES_PASSWORD` | 예 | 강한 DB 비밀번호. 기존 서버에서는 PostgreSQL 내부 비밀번호를 먼저 교체한 뒤 `.env`를 바꿉니다. |
-| `DATABASE_URL` | 예 | backend 전용 PostgreSQL connection string입니다. POSTGRES 설정과 일치시킵니다. |
 | `JWT_SECRET` | 예 | `openssl rand -hex 32`의 고유 출력값. 변경하면 모든 로그인 세션이 만료됩니다. |
 | `SHARE_SECRET` | 예 | JWT와 다른 `openssl rand -hex 32` 출력값. 새 공개 링크 서명에 사용합니다. |
 | `LEGACY_SHARE_SECRET` | 아니오 | 예전 share/JWT key로 서명된 공개 링크를 임시 유지할 때만 입력합니다. |
 | `PUBLIC_URL` | 예 | 브라우저가 사용할 정확한 origin입니다. scheme, host, port를 모두 포함하며 CORS와 공유 URL 기준이 됩니다. |
-| `BACKEND_BIND_ADDRESS` | 예 | backend process bind 주소입니다. |
-| `BACKEND_PORT` | 예 | backend process port입니다. |
-| `BACKEND_HEALTHCHECK_HOST` | 예 | backend container 내부 healthcheck 대상입니다. |
-| `BACKEND_UPSTREAM` | 예 | frontend reverse proxy가 사용할 backend origin입니다. |
-| `FRONTEND_BIND_ADDRESS` | 예 | frontend host bind 주소입니다. |
 | `FRONTEND_PORT` | 예 | NPM 또는 browser가 연결할 frontend port입니다. |
 | `MAX_UPLOAD_BYTES` | 기본값 | 파일 하나당 업로드 상한 byte 값입니다. `10737418240`은 10 GiB입니다. |
 | `DEFAULT_STORAGE_QUOTA_BYTES` | 기본값 | 새 사용자 기본 quota byte 값입니다. 기존 사용자 quota는 바뀌지 않습니다. |
@@ -65,7 +60,7 @@ docker compose up -d --build
 
 ## 직접 HTTP 접속
 
-NPM 없이 직접 접속할 때도 `PUBLIC_URL`, frontend bind 주소와 port를 `.env`에 정확히
+NPM 없이 직접 접속할 때도 `PUBLIC_URL`과 frontend port를 `.env`에 정확히
 입력합니다. HTTP origin은 literal IP에만 허용됩니다. 일반 도메인은
 HTTPS를 사용해야 합니다. Router와 firewall에서는 frontend port의 접근 범위를 신뢰하는
 network로 제한합니다.

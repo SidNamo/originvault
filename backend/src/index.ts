@@ -537,8 +537,8 @@ async function start(): Promise<void> {
   if (unsafeSecret(config.shareSecret)) throw new Error('SHARE_SECRET must be set to a strong random value');
   if (config.legacyShareSecret && unsafeSecret(config.legacyShareSecret)) throw new Error('LEGACY_SHARE_SECRET must be a strong random value when set');
   if (config.jwtSecret === config.shareSecret) throw new Error('JWT_SECRET and SHARE_SECRET must be different values');
-  if (!config.databaseUrl) throw new Error('DATABASE_URL must be set');
-  if (!config.bindAddress) throw new Error('BACKEND_BIND_ADDRESS must be set');
+  if (!config.postgresDatabase || !config.postgresUser || !config.postgresPassword)
+    throw new Error('POSTGRES_DB, POSTGRES_USER, and POSTGRES_PASSWORD must be set');
   if (!Number.isSafeInteger(config.maxUploadBytes) || config.maxUploadBytes < 0) throw new Error('MAX_UPLOAD_BYTES must be a non-negative safe integer');
   if (!/^\d+$/.test(config.defaultStorageQuotaBytes)) throw new Error('DEFAULT_STORAGE_QUOTA_BYTES must be a non-negative integer');
   if (!config.publicUrl) throw new Error('PUBLIC_URL must be set');
@@ -564,7 +564,7 @@ async function start(): Promise<void> {
   await purgeExpiredTrash();
   const trashCleanupTimer = setInterval(() => { void purgeExpiredTrash(); }, 6 * 60 * 60 * 1_000);
   trashCleanupTimer.unref();
-  const server = app.listen(config.port, config.bindAddress, () => logger.info({ event: 'service_ready', port: config.port, bindAddress: config.bindAddress }, 'OriginVault backend is ready'));
+  const server = app.listen(config.port, () => logger.info({ event: 'service_ready', port: config.port }, 'OriginVault backend is ready'));
   const shutdown = (signal: string) => {
     logger.warn({ event: 'service_shutdown_started', signal }, 'OriginVault backend shutdown started');
     server.close(async (error) => {

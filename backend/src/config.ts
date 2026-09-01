@@ -14,9 +14,12 @@ function configuredOrigins(): string[] {
 }
 
 export const config = {
-  port: Number(process.env.PORT ?? 4000),
-  bindAddress: process.env.BACKEND_BIND_ADDRESS ?? '',
-  databaseUrl: process.env.DATABASE_URL ?? '',
+  port: 4000,
+  postgresHost: 'postgres',
+  postgresPort: 5432,
+  postgresDatabase: process.env.POSTGRES_DB ?? '',
+  postgresUser: process.env.POSTGRES_USER ?? '',
+  postgresPassword: process.env.POSTGRES_PASSWORD ?? '',
   jwtSecret: process.env.JWT_SECRET ?? 'development-only-secret-change-me',
   shareSecret: process.env.SHARE_SECRET ?? '',
   legacyShareSecret: process.env.LEGACY_SHARE_SECRET ?? '',

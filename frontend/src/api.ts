@@ -1,5 +1,5 @@
 /// <reference types="vite/client" />
-const API_URL = import.meta.env.VITE_API_URL ?? "/api";
+const API_URL = "/api";
 const apiResourceUrl = (path: string) =>
   `${API_URL}${path.replace(/^\/api/, "")}`;
 

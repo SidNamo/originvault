@@ -3,7 +3,13 @@ import { config } from './config.js';
 import { logger } from './logger.js';
 
 const { Pool } = pg;
-export const db = new Pool({ connectionString: config.databaseUrl });
+export const db = new Pool({
+  host: config.postgresHost,
+  port: config.postgresPort,
+  database: config.postgresDatabase,
+  user: config.postgresUser,
+  password: config.postgresPassword,
+});
 db.on('connect', () => logger.debug({ event: 'database_connection_opened' }, 'PostgreSQL connection opened'));
 db.on('remove', () => logger.debug({ event: 'database_connection_closed' }, 'PostgreSQL connection closed'));
 db.on('error', (error) => logger.error({ event: 'database_pool_error', err: error }, 'Unexpected PostgreSQL pool error'));
