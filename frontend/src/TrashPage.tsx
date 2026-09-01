@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
-import { CheckSquare, ChevronLeft, File, Folder, FolderOpen, Info, MoreHorizontal, RefreshCw, RotateCcw, Trash2, X } from "lucide-react";
+import { CheckSquare, ChevronLeft, File, FileImage, FileVideo, Folder, FolderOpen, Info, MoreHorizontal, RefreshCw, RotateCcw, Trash2, X } from "lucide-react";
 import { api, type FilePreview, type StorageUsage, type TrashFolder, type TrashFolderContents, type TrashItem, type VaultFile } from "./api";
 import { CollisionDialog } from "./CollisionDialog";
 import { formatBytes } from "./format";
 import { PreviewViewer } from "./PreviewViewer";
 import { ListingControls, type ListingSortDirection, type ListingSortField, type ListingViewMode } from "./ListingControls";
+import { LazyFileThumbnail } from "./LazyFileThumbnail";
 
 type TrashAction = { type: "file" | "folder"; id: string; name: string; root: boolean };
 const date = (value: string) => new Date(value).toLocaleString("ko-KR");
@@ -350,10 +351,10 @@ export function TrashPage({
           <h1>{folder?.name ?? "휴지통"}</h1>
           <p>삭제한 항목은 {retentionDays}일 동안 보관한 뒤 자동으로 영구 삭제됩니다.</p>
         </div>
-        <div className="actions">
-          <button className="secondary compact danger-compact" onClick={() => void permanentlyDeleteAll()} disabled={!items.length || Boolean(busy)}><Trash2 />전체 즉시 삭제</button>
-          <button className="secondary compact" onClick={() => void refreshCurrent()} disabled={loading}>
-            <RefreshCw className={loading ? "spin" : ""} />새로고침
+        <div className="page-actions">
+          <button className="secondary danger-compact" aria-label="전체 즉시 삭제" title="전체 즉시 삭제" onClick={() => void permanentlyDeleteAll()} disabled={!items.length || Boolean(busy)}><Trash2 /><span>전체 즉시 삭제</span></button>
+          <button className="secondary" aria-label="새로고침" title="새로고침" onClick={() => void refreshCurrent()} disabled={loading}>
+            <RefreshCw className={loading ? "spin" : ""} /><span>새로고침</span>
           </button>
         </div>
       </header>
@@ -368,7 +369,7 @@ export function TrashPage({
           ))}
         </nav>
       )}
-      <div className="trash-list-tools">
+      <div className="listing-tools">
         <ListingControls itemCount={visibleItems.length} sortField={sortField} sortDirection={sortDirection} viewMode={viewMode} onSortFieldChange={setSortField} onSortDirectionChange={() => setSortDirection((current) => current === "asc" ? "desc" : "asc")} onViewModeChange={setViewMode} />
       </div>
       <div className={`selection-toolbar ${selections.length ? "has-selection" : ""}`}>
@@ -382,12 +383,12 @@ export function TrashPage({
       <div ref={listRef} className={`panel-card trash-list view-${viewMode} ${marqueeSelecting ? "marquee-selecting" : ""}`}>
         {selectionBox && <div className="selection-box main-selection-box" style={selectionBox} />}
         {loading ? <div className="trash-empty">휴지통을 불러오는 중입니다.</div> : folder ? (
-          !contents?.folders.length && !contents?.files.length ? <div className="trash-empty">이 폴더는 비어 있습니다.</div> : <>
+          !contents?.folders.length && !contents?.files.length ? <div className="trash-empty"><div className="trash-empty-icon"><FolderOpen /></div><h2>이 폴더는 비어 있습니다</h2><p>삭제된 항목이 있으면 이곳에서 확인하고 복원할 수 있습니다.</p></div> : <>
             {sortedFolders.map((item) => {
               const action = toAction({ type: "folder", id: item.id, name: item.name });
               const key = actionKey(action);
               return <article data-trash-select-key={key} className={`trash-item ${selectedKeys.has(key) ? "selected" : ""}`} key={`folder:${item.id}`} onClick={(event) => handleCardClick(key, event)} onDoubleClick={() => openFolder(item)} onContextMenu={(event) => showMenu(event, action)}>
-                <div className="trash-kind"><Folder /></div>
+                {viewMode === "preview" ? <div className="file-preview-thumb folder-thumb" aria-hidden="true"><Folder /></div> : <div className="trash-kind"><Folder /></div>}
                 <div className="trash-item-main"><strong>{item.name}</strong><small>폴더 · 삭제 {date(item.trashedAt)}</small></div>
                 <div className="trash-actions"><button className="secondary compact" onClick={(event) => { event.stopPropagation(); openFolder(item); }}><FolderOpen />열기</button><button className="icon-action" title="메뉴" onClick={(event) => showMenu(event, action)}><MoreHorizontal /></button></div>
               </article>;
@@ -395,20 +396,22 @@ export function TrashPage({
             {sortedFiles.map((item) => {
               const action = toAction({ type: "file", id: item.id, name: item.name });
               const key = actionKey(action);
+              const Icon = item.mimeType.startsWith("image/") ? FileImage : item.mimeType.startsWith("video/") ? FileVideo : File;
               return <article data-trash-select-key={key} className={`trash-item ${selectedKeys.has(key) ? "selected" : ""}`} key={`file:${item.id}`} onClick={(event) => handleCardClick(key, event)} onDoubleClick={() => openPreview(item)} onContextMenu={(event) => showMenu(event, action)}>
-                <div className="trash-kind"><File /></div>
+                {viewMode === "preview" ? <LazyFileThumbnail fileId={item.id} version={item.sha256} kind={item.mimeType.startsWith("image/") ? "image" : item.mimeType.startsWith("video/") ? "video" : "unsupported"} source="trash" fallback={Icon} /> : <div className="trash-kind"><Icon /></div>}
                 <div className="trash-item-main"><strong>{item.name}</strong><small>{formatBytes(item.sizeBytes)} · 파일 미리보기</small></div>
                 <button className="icon-action" title="메뉴" onClick={(event) => showMenu(event, action)}><MoreHorizontal /></button>
               </article>;
             })}
           </>
-        ) : !items.length ? <div className="trash-empty">휴지통이 비어 있습니다.</div> : sortedRootItems.map((item) => {
+        ) : !items.length ? <div className="trash-empty"><div className="trash-empty-icon"><Trash2 /></div><h2>휴지통이 비어 있습니다</h2><p>삭제한 파일과 폴더는 {retentionDays}일 동안 이곳에 보관되며, 필요할 때 원래 위치로 복원할 수 있습니다.</p></div> : sortedRootItems.map((item) => {
           const action = toAction(item, true);
           const key = actionKey(action);
+          const Icon = item.type === "folder" ? Folder : item.mimeType?.startsWith("image/") ? FileImage : item.mimeType?.startsWith("video/") ? FileVideo : File;
           return <article data-trash-select-key={key} className={`trash-item ${selectedKeys.has(key) ? "selected" : ""}`} key={`${item.type}:${item.id}`} onClick={(event) => handleCardClick(key, event)} onDoubleClick={() => item.type === "folder"
             ? openFolder({ id: item.id, name: item.name, parentId: null, createdAt: item.trashedAt, modifiedAt: item.trashedAt, trashedAt: item.trashedAt })
             : openPreview(item)} onContextMenu={(event) => showMenu(event, action)}>
-            <div className="trash-kind">{item.type === "folder" ? <Folder /> : <File />}</div>
+            {viewMode === "preview" ? item.type === "folder" ? <div className="file-preview-thumb folder-thumb" aria-hidden="true"><Folder /></div> : <LazyFileThumbnail fileId={item.id} version={item.id} kind={item.mimeType?.startsWith("image/") ? "image" : item.mimeType?.startsWith("video/") ? "video" : "unsupported"} source="trash" fallback={Icon} /> : <div className="trash-kind"><Icon /></div>}
             <div className="trash-item-main">
               <strong>{item.name}</strong>
               <small>{item.type === "folder" ? `파일 ${item.fileCount.toLocaleString("ko-KR")}개 · 폴더 ${Math.max(0, item.folderCount - 1).toLocaleString("ko-KR")}개` : "파일"}{` · ${formatBytes(item.sizeBytes)}`}</small>

@@ -14,6 +14,7 @@ import { config } from './config.js';
 import { requireAuth } from './auth.js';
 import { db } from './db.js';
 import { assertStorageAvailable } from './quota.js';
+import { createRateLimiter } from './rateLimit.js';
 import {
   detectTextEncodingFromBytes,
   etagMatches,
@@ -38,6 +39,16 @@ type ShareAccess = 'read' | 'readwrite';
 const SHARE_PASSWORD_MAX_BYTES = 72;
 const SHARE_ACCESS_COOKIE_PREFIX = 'originvault_share_access_';
 const SHARE_ACCESS_COOKIE_MAX_AGE_MS = 12 * 60 * 60 * 1_000;
+const publicPasswordRateLimit = createRateLimiter({
+  windowMs: 15 * 60 * 1_000,
+  max: 10,
+  key: (req) => `${req.ip}:${req.params.token ?? ''}`,
+});
+const publicWriteRateLimit = createRateLimiter({
+  windowMs: 60 * 1_000,
+  max: 30,
+  key: (req) => `${req.ip}:${req.params.token ?? ''}`,
+});
 
 function normalizeShareAccess(value: unknown, targetType: 'file' | 'folder'): ShareAccess {
   if (value === undefined || value === null || value === '') return 'read';
@@ -57,6 +68,7 @@ function normalizeIncludeHidden(value: unknown, targetType: 'file' | 'folder'): 
 function normalizeSharePassword(value: unknown): string | null {
   if (value === undefined || value === null || value === '') return null;
   if (typeof value !== 'string') throw new ShareError(400, 'Share password must be text');
+  if (value.length < 12) throw new ShareError(400, 'Share passwords must be at least 12 characters');
   if (Buffer.byteLength(value, 'utf8') > SHARE_PASSWORD_MAX_BYTES)
     throw new ShareError(400, `Share passwords must be at most ${SHARE_PASSWORD_MAX_BYTES} UTF-8 bytes`);
   return value;
@@ -101,8 +113,8 @@ function validSharePasswordSession(req: Request, share: { id: string; passwordVe
 function setSharePasswordSessionCookie(res: Response, req: Request, token: string, share: { id: string }): void {
   res.cookie(sharePasswordCookieName(share.id), token, {
     httpOnly: true,
-    sameSite: 'lax',
-    secure: req.secure,
+    sameSite: 'strict',
+    secure: config.publicUrl.startsWith('https://') || req.secure,
     maxAge: SHARE_ACCESS_COOKIE_MAX_AGE_MS,
     path: `/api/public/shares/${encodeURIComponent(String(req.params.token))}`,
   });
@@ -378,15 +390,18 @@ function shareToken(id: string, version = 0): string {
 }
 
 function shareIdentityFromToken(token: string): { id: string; version: number } {
-  try {
-    const payload = jwt.verify(token, config.shareSecret, { algorithms: ['HS256'], issuer: 'originvault-share', audience: 'originvault-public' }) as JwtPayload;
-    if (!payload.sub || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(payload.sub)) throw new Error('Invalid subject');
-    const version = payload.version ?? 0;
-    if (!Number.isSafeInteger(version) || version < 0) throw new Error('Invalid version');
-    return { id: payload.sub, version };
-  } catch {
-    throw new ShareError(404, 'Share not found');
+  for (const secret of new Set([config.shareSecret, config.legacyShareSecret].filter(Boolean))) {
+    try {
+      const payload = jwt.verify(token, secret, { algorithms: ['HS256'], issuer: 'originvault-share', audience: 'originvault-public' }) as JwtPayload;
+      if (!payload.sub || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(payload.sub)) continue;
+      const version = payload.version ?? 0;
+      if (!Number.isSafeInteger(version) || version < 0) continue;
+      return { id: payload.sub, version };
+    } catch {
+      // Try the legacy signing key only while pre-migration links still exist.
+    }
   }
+  throw new ShareError(404, 'Share not found');
 }
 
 function baseUrl(req: Request): string {
@@ -1085,7 +1100,7 @@ export function createShareRouter(): express.Router {
     res.json(share);
   }));
 
-  router.post('/api/public/shares/:token/access', asyncHandler(async (req, res) => {
+  router.post('/api/public/shares/:token/access', publicPasswordRateLimit, asyncHandler(async (req, res) => {
     const password = typeof req.body?.password === 'string' ? req.body.password : '';
     const client = await db.connect();
     try {
@@ -1111,7 +1126,7 @@ export function createShareRouter(): express.Router {
     }
   }));
 
-  router.post('/api/public/shares/:token/upload', (req, res, next) => {
+  router.post('/api/public/shares/:token/upload', publicWriteRateLimit, (req, res, next) => {
     const requestedFolderId = typeof req.query.folderId === 'string'
       ? requestUuid(req.query.folderId, 'Folder not found')
       : '';
@@ -1194,7 +1209,7 @@ export function createShareRouter(): express.Router {
     }
   });
 
-  router.delete('/api/public/shares/:token/items', asyncHandler(async (req, res) => {
+  router.delete('/api/public/shares/:token/items', publicWriteRateLimit, asyncHandler(async (req, res) => {
     const parsed = parsePublicArchiveRequest({ mode: 'selection', selections: req.body?.selections });
     const client = await db.connect();
     const physicalMoves: Array<{ from: string; to: string }> = [];

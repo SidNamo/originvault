@@ -64,6 +64,7 @@ import { PreviewViewer } from "./PreviewViewer";
 import { ShareDialog } from "./ShareDialog";
 import { CollisionDialog } from "./CollisionDialog";
 import { ListingControls, type ListingSortDirection, type ListingSortField, type ListingViewMode } from "./ListingControls";
+import { LazyFileThumbnail } from "./LazyFileThumbnail";
 import { beginClipboardCopy, copyText } from "./clipboard";
 const UPLOAD_CHUNK_BYTES = 5 * 1024 * 1024;
 const HASH_CHUNK_BYTES = 8 * 1024 * 1024;
@@ -264,43 +265,6 @@ const droppedFiles = async (dataTransfer: DataTransfer): Promise<UploadCandidate
   ).flat();
 };
 
-function FileThumbnail({
-  file,
-  fallback: Fallback,
-}: {
-  file: VaultFile;
-  fallback: React.ComponentType<{ size?: number }>;
-}) {
-  const [previewUrl, setPreviewUrl] = useState("");
-  const isImage = file.mimeType.startsWith("image/");
-  const isVideo = file.mimeType.startsWith("video/");
-  useEffect(() => {
-    if (!isImage && !isVideo) return;
-    let active = true;
-    void api
-      .filePreview(file.id)
-      .then((result) => {
-        if (active) setPreviewUrl(result.file.streamUrl ?? "");
-      })
-      .catch(() => undefined);
-    return () => {
-      active = false;
-    };
-  }, [file.id, isImage, isVideo]);
-
-  return (
-    <div className="file-preview-thumb" aria-hidden="true">
-      {previewUrl && isImage ? (
-        <img src={previewUrl} alt="" loading="lazy" />
-      ) : previewUrl && isVideo ? (
-        <video src={previewUrl} muted playsInline preload="metadata" />
-      ) : (
-        <Fallback size={36} />
-      )}
-    </div>
-  );
-}
-
 function Auth({ onDone }: { onDone: (user: UserProfile) => void }) {
   const [mode, setMode] = useState<"login" | "register">("login");
   const [username, setUsername] = useState("");
@@ -387,7 +351,7 @@ function Auth({ onDone }: { onDone: (user: UserProfile) => void }) {
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             required
-            minLength={8}
+            minLength={12}
           />
         </label>
         {error && <div className="error">{error}</div>}
@@ -443,7 +407,22 @@ function Dashboard({
   const [allFolders, setAllFolders] = useState<VaultFolder[]>([]);
   const [trail, setTrail] = useState<VaultFolder[]>([]);
   const [previewFile, setPreviewFile] = useState<VaultFile>();
-  const [message, setMessage] = useState("");
+  const [notices, setNotices] = useState<Array<{ id: string; message: string }>>([]);
+  const setMessage = useCallback((message: string) => {
+    if (!message) return;
+    setNotices((current) => [...current, { id: createClientId(), message }]);
+  }, []);
+  const dismissNotice = useCallback((id: string) => {
+    setNotices((current) => current.filter((notice) => notice.id !== id));
+  }, []);
+  useEffect(() => {
+    const oldest = notices[0];
+    if (!oldest) return;
+    const timer = window.setTimeout(() => {
+      setNotices((current) => current[0]?.id === oldest.id ? current.slice(1) : current);
+    }, 5_000);
+    return () => window.clearTimeout(timer);
+  }, [notices[0]?.id]);
   const [uploadTasks, setUploadTasks] = useState<UploadTask[]>(() =>
     restoreUploadQueue(username),
   );
@@ -2238,18 +2217,18 @@ function Dashboard({
             <span>내 파일</span>
           </button>
           <button
-            className={activeView === "shares" ? "active" : ""}
-            onClick={() => setActiveView("shares")}
-          >
-            <Share2 />
-            <span>공유</span>
-          </button>
-          <button
             className={activeView === "trash" ? "active" : ""}
             onClick={() => setActiveView("trash")}
           >
             <Trash2 />
             <span>휴지통</span>
+          </button>
+          <button
+            className={activeView === "shares" ? "active" : ""}
+            onClick={() => setActiveView("shares")}
+          >
+            <Share2 />
+            <span>공유</span>
           </button>
           <button
             className={activeView === "settings" ? "active" : ""}
@@ -2322,48 +2301,58 @@ function Dashboard({
         onPointerUp={handleSelectionPointerUp}
         onPointerCancel={handleSelectionPointerCancel}
       >
-        {message && (
-          <div
-            className="notice global-notice"
-            role="status"
-            onClick={() => setMessage("")}
-          >
-            {message}
-            <X size={15} />
-          </div>
-        )}
+        <div className="global-notice-stack" aria-live="polite" aria-relevant="additions removals">
+          {notices.map((notice) => (
+            <div
+              key={notice.id}
+              className="notice global-notice"
+              role="status"
+              onClick={() => dismissNotice(notice.id)}
+            >
+              {notice.message}
+              <X size={15} aria-hidden="true" />
+            </div>
+          ))}
+        </div>
         {activeView === "files" && (
-          <>
-            <header className="topbar">
+          <section className="workspace-page files-page">
+            <header className="page-hero">
               <div>
                 <p className="eyebrow">MY PRIVATE SPACE</p>
                 <h1>{folder?.name ?? "내 파일"}</h1>
+                <p>개인 파일과 폴더를 안전하게 관리합니다.</p>
               </div>
-              <div className="actions">
+              <div className="page-actions">
                 <button
                   className="secondary"
+                  aria-label="새로고침"
+                  title="새로고침"
                   onClick={() => void refreshFiles()}
                   disabled={filesRefreshing}
                 >
                   <RefreshCw className={filesRefreshing ? "spin" : ""} />
-                  새로고침
+                  <span>새로고침</span>
                 </button>
-                <button className="secondary" onClick={createFolder}>
-                  <FolderPlus />새 폴더
+                <button className="secondary" aria-label="새 폴더" title="새 폴더" onClick={createFolder}>
+                  <FolderPlus /><span>새 폴더</span>
                 </button>
                 <button
                   className="secondary"
+                  aria-label="폴더 업로드"
+                  title="폴더 업로드"
                   onClick={openFolderPicker}
                 >
                   <FolderUp />
-                  폴더 업로드
+                  <span>폴더 업로드</span>
                 </button>
                 <button
                   className="primary"
+                  aria-label={isUploading ? "파일 추가" : "파일 업로드"}
+                  title={isUploading ? "파일 추가" : "파일 업로드"}
                   onClick={() => picker.current?.click()}
                 >
                   <Upload />
-                  {isUploading ? "파일 추가" : "파일 업로드"}
+                  <span>{isUploading ? "파일 추가" : "파일 업로드"}</span>
                 </button>
                 <input
                   ref={picker}
@@ -2381,17 +2370,19 @@ function Dashboard({
                 />
               </div>
             </header>
-            <div className="breadcrumbs">
-              <button onClick={() => setTrail([])}>내 파일</button>
-              {trail.map((part, i) => (
-                <span key={part.id}>
-                  <ChevronRight />
-                  <button onClick={() => setTrail(trail.slice(0, i + 1))}>
-                    {part.name}
-                  </button>
-                </span>
-              ))}
-            </div>
+            {folder && (
+              <div className="breadcrumbs">
+                <button onClick={() => setTrail([])}>내 파일</button>
+                {trail.map((part, i) => (
+                  <span key={part.id}>
+                    <ChevronRight />
+                    <button onClick={() => setTrail(trail.slice(0, i + 1))}>
+                      {part.name}
+                    </button>
+                  </span>
+                ))}
+              </div>
+            )}
             <UploadQueue
               tasks={uploadTasks}
               batch={uploadBatch}
@@ -2402,6 +2393,17 @@ function Dashboard({
               onResumeAll={resumeAllUploads}
               onCancelAll={cancelAllUploads}
             />
+            <div className="listing-tools">
+              <ListingControls
+                itemCount={items.folders.length + items.files.length}
+                sortField={sortField}
+                sortDirection={sortDirection}
+                viewMode={viewMode}
+                onSortFieldChange={setSortField}
+                onSortDirectionChange={() => setSortDirection((current) => current === "asc" ? "desc" : "asc")}
+                onViewModeChange={setViewMode}
+              />
+            </div>
             <SelectionToolbar
               selectedCount={selections.length}
               totalCount={currentKeys.length}
@@ -2424,23 +2426,6 @@ function Dashboard({
               onDragLeave={(event) => clearDropTarget(event, "current")}
               onDrop={(event) => handleDropAt(event, folder)}
             >
-              <div className="section-heading">
-                <div>
-                  <h2>파일과 폴더</h2>
-                    <small>
-                      클릭·Ctrl·Shift로 선택 · 드래그로 범위 선택 · 항목 드래그로 이동
-                    </small>
-                </div>
-                <ListingControls
-                  itemCount={items.folders.length + items.files.length}
-                  sortField={sortField}
-                  sortDirection={sortDirection}
-                  viewMode={viewMode}
-                  onSortFieldChange={setSortField}
-                  onSortDirectionChange={() => setSortDirection((current) => current === "asc" ? "desc" : "asc")}
-                  onViewModeChange={setViewMode}
-                />
-              </div>
               {selectionBox && (
                 <div className="selection-box main-selection-box" style={selectionBox} />
               )}{" "}
@@ -2619,7 +2604,13 @@ function Dashboard({
                         }
                       >
                         {viewMode === "preview" ? (
-                          <FileThumbnail file={item} fallback={Icon} />
+                          <LazyFileThumbnail
+                            fileId={item.id}
+                            version={item.sha256}
+                            kind={item.mimeType.startsWith("image/") ? "image" : item.mimeType.startsWith("video/") ? "video" : "unsupported"}
+                            source="files"
+                            fallback={Icon}
+                          />
                         ) : (
                           <div className="file-icon">
                             <Icon />
@@ -2670,7 +2661,7 @@ function Dashboard({
                 </div>
               )}
             </section>
-          </>
+          </section>
         )}
         {activeView === "shares" && (
           <SharesPage folders={allFolders} onMessage={setMessage} />

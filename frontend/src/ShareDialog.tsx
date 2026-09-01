@@ -65,6 +65,7 @@ export function ShareDialog({
           <input
             type="password"
             autoComplete="new-password"
+            minLength={12}
             maxLength={72}
             value={password}
             onChange={(event) => setPassword(event.target.value)}

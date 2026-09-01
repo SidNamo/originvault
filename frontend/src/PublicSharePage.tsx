@@ -5,6 +5,8 @@ import {
   Download,
   Eye,
   File,
+  FileImage,
+  FileVideo,
   Folder,
   Info,
   Link2,
@@ -26,6 +28,7 @@ import {
 import { formatBytes } from "./format";
 import { PublicPreviewViewer } from "./PublicPreviewViewer";
 import { ListingControls, type ListingSortDirection, type ListingSortField, type ListingViewMode } from "./ListingControls";
+import { LazyFileThumbnail } from "./LazyFileThumbnail";
 
 type PublicItem =
   | { type: "file"; item: PublicShareFile }
@@ -474,15 +477,16 @@ export function PublicSharePage({ token }: { token: string }) {
                     const key = itemKey("folder", folder.id);
                     const selected = selectedKeys.has(key);
                     return <article data-public-select-key={key} className={`public-item ${selected ? "selected" : ""}`} key={folder.id} onClick={(event) => handleCardClick(key, event)} onDoubleClick={() => void openFolder(folder)} onContextMenu={(event) => showItemMenu(event, { type: "folder", item: folder })}>
-                      <Folder /><span><strong>{folder.name}</strong><small>폴더 열기</small></span>
+                      {viewMode === "preview" ? <div className="file-preview-thumb folder-thumb" aria-hidden="true"><Folder /></div> : <Folder />}<span><strong>{folder.name}</strong><small>폴더 열기</small></span>
                       <div className="public-item-actions"><button aria-label={`${folder.name} 열기`} title="폴더 열기" onClick={(event) => { event.stopPropagation(); void openFolder(folder); }}><ArrowLeft className="public-open-folder" /></button><button aria-label={`${folder.name} 메뉴`} title="메뉴" onClick={(event) => { event.stopPropagation(); setContextMenu({ x: event.clientX, y: event.clientY, item: { type: "folder", item: folder } }); }}><MoreHorizontal /></button></div>
                     </article>;
                   })}
                   {sortedFiles.map((file) => {
                     const key = itemKey("file", file.id);
                     const selected = selectedKeys.has(key);
+                    const Icon = file.kind === "image" ? FileImage : file.kind === "video" ? FileVideo : File;
                     return <article data-public-select-key={key} className={`public-item ${selected ? "selected" : ""}`} key={file.id} onClick={(event) => handleCardClick(key, event)} onDoubleClick={() => setPreviewFile(file)} onContextMenu={(event) => showItemMenu(event, { type: "file", item: file })}>
-                      <File /><span><strong>{file.name}</strong><small>{formatBytes(file.sizeBytes)}</small></span>
+                      {viewMode === "preview" ? <LazyFileThumbnail fileId={file.id} version={file.sha256} kind={file.kind === "image" ? "image" : file.kind === "video" ? "video" : "unsupported"} source="public" shareToken={token} fallback={Icon} /> : <Icon />}<span><strong>{file.name}</strong><small>{formatBytes(file.sizeBytes)}</small></span>
                       <div className="public-item-actions"><button aria-label={`${file.name} 미리보기`} title="미리보기" onClick={(event) => { event.stopPropagation(); setPreviewFile(file); }}><Eye /></button><a aria-label={`${file.name} 원본 다운로드`} title="원본 다운로드" href={api.publicShareDownloadUrl(token, file.id)} onClick={(event) => event.stopPropagation()}><Download /></a><button aria-label={`${file.name} 메뉴`} title="메뉴" onClick={(event) => { event.stopPropagation(); setContextMenu({ x: event.clientX, y: event.clientY, item: { type: "file", item: file } }); }}><MoreHorizontal /></button></div>
                     </article>;
                   })}

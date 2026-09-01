@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { parseWebdavMtime, webdavContentType, webdavHref, webdavPathSegments } from '../src/webdav.js';
+import { parseWebdavMtime, webdavContentType, webdavHref, webdavPathSegments, webdavQuota } from '../src/webdav.js';
 
 test('WebDAV hrefs use only the /webdav endpoint', () => {
   assert.equal(webdavHref([], true), '/webdav/');
@@ -28,4 +28,16 @@ test('WebDAV uses extracted MIME metadata for generic uploads', () => {
   assert.equal(webdavContentType(undefined, { 'File:MIMEType': 'video/mp4' }), 'video/mp4');
   assert.equal(webdavContentType('text/plain; charset=utf-8', { 'File:MIMEType': 'application/octet-stream' }), 'text/plain');
   assert.equal(webdavContentType('application/octet-stream', { 'File:MIMEType': 'invalid' }), 'application/octet-stream');
+});
+
+test('WebDAV reports effective usage and available bytes for quota-limited users', () => {
+  assert.deepEqual(webdavQuota({ usedBytes: '600', reservedBytes: '50', quotaBytes: '1000' }), {
+    usedBytes: '650',
+    availableBytes: '350',
+  });
+  assert.deepEqual(webdavQuota({ usedBytes: '1200', reservedBytes: '0', quotaBytes: '1000' }), {
+    usedBytes: '1200',
+    availableBytes: '0',
+  });
+  assert.equal(webdavQuota({ usedBytes: '600', reservedBytes: '0', quotaBytes: null }), null);
 });

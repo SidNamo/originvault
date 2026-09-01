@@ -133,6 +133,7 @@ export interface TrashItem {
   fileCount: number;
   folderCount: number;
   sizeBytes: string;
+  mimeType?: string | null;
 }
 export interface TrashFolder {
   id: string;
@@ -721,6 +722,13 @@ export const api = {
       result.file.streamUrl = apiResourceUrl(result.file.streamUrl);
     return result;
   },
+  filePreviewTicket: async (id: string, signal?: AbortSignal) => {
+    const result = await request<{ url: string }>(
+      `/files/${encodeURIComponent(id)}/preview-ticket`,
+      { method: "POST", signal },
+    );
+    return apiResourceUrl(result.url);
+  },
   trashFilePreview: async (id: string) => {
     const result = await request<FilePreview>(
       `/trash/files/${encodeURIComponent(id)}/preview`,
@@ -728,6 +736,13 @@ export const api = {
     if (result.file.streamUrl)
       result.file.streamUrl = apiResourceUrl(result.file.streamUrl);
     return result;
+  },
+  trashFilePreviewTicket: async (id: string, signal?: AbortSignal) => {
+    const result = await request<{ url: string }>(
+      `/trash/files/${encodeURIComponent(id)}/preview-ticket`,
+      { method: "POST", signal },
+    );
+    return apiResourceUrl(result.url);
   },
   fileText: async (id: string, encoding = "auto"): Promise<TextFileContent> => {
     const response = await fetch(

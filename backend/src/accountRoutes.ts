@@ -34,7 +34,7 @@ export function normalizeDisplayName(value: unknown, fallback?: string): string 
 
 export function normalizePassword(value: unknown): string {
   const password = typeof value === 'string' ? value : '';
-  if (password.length < 8) throw new AccountError(400, 'Password must be at least 8 characters');
+  if (password.length < 12) throw new AccountError(400, 'Password must be at least 12 characters');
   if (Buffer.byteLength(password, 'utf8') > 72) throw new AccountError(400, 'Password must be at most 72 UTF-8 bytes');
   return password;
 }
@@ -72,7 +72,7 @@ export function createAccountRouter(): express.Router {
   router.get('/api/auth/registration-status', asyncHandler(async (_req, res) => {
     const result = await db.query(`
       SELECT s.registration_enabled AS "registrationEnabled",
-        NOT EXISTS(SELECT 1 FROM users WHERE is_admin=true AND disabled_at IS NULL) AS "bootstrapRequired"
+        NOT EXISTS(SELECT 1 FROM users) AS "bootstrapRequired"
       FROM app_settings s WHERE s.id=1
     `);
     res.json(result.rows[0] ?? { registrationEnabled: true, bootstrapRequired: true });
@@ -167,7 +167,9 @@ export function createAccountRouter(): express.Router {
     const username = normalizeUsername(req.body?.username);
     const displayName = normalizeDisplayName(req.body?.displayName, username);
     const password = normalizePassword(req.body?.password);
-    const quota = normalizeQuota(req.body?.storageQuotaBytes);
+    const quota = Object.prototype.hasOwnProperty.call(req.body ?? {}, 'storageQuotaBytes')
+      ? normalizeQuota(req.body.storageQuotaBytes)
+      : config.defaultStorageQuotaBytes;
     const isAdmin = req.body?.isAdmin === true;
     const passwordHash = await bcrypt.hash(password, 12);
     const result = await db.query<{ id: string; storage_key: string }>(`

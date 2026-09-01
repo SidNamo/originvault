@@ -19,11 +19,11 @@ test('daily log filenames and seven-day retention use UTC calendar dates', async
       'originvault-2026-08-10.log',
       'other.log',
     ], 7, now), ['originvault-2026-08-03.log']);
-    logger.trace({ event: 'test_trace_file_output' }, 'Trace file output test');
+    logger.info({ event: 'test_info_file_output' }, 'Info file output test');
     await new Promise((resolve) => setTimeout(resolve, 25));
     const logText = await readFile(path.join(temp, `originvault-${utcDate()}.log`), 'utf8');
-    assert.match(logText, /"level":"TRACE"/);
-    assert.match(logText, /"event":"test_trace_file_output"/);
+    assert.match(logText, /"level":"INFO"/);
+    assert.match(logText, /"event":"test_info_file_output"/);
   } finally {
     await rm(temp, { recursive: true, force: true });
   }

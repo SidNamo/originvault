@@ -330,14 +330,18 @@ export function SharesPage({
           <h1>공유</h1>
           <p>원본 링크와 WebDAV 기기 접근을 한 곳에서 관리합니다.</p>
         </div>
-        <button
-          className="secondary"
-          onClick={() => void Promise.all([loadShares(), loadDav()])}
-          disabled={loading}
-        >
-          <RefreshCw className={loading ? "spin" : ""} />
-          새로고침
-        </button>
+        <div className="page-actions">
+          <button
+            className="secondary"
+            aria-label="새로고침"
+            title="새로고침"
+            onClick={() => void Promise.all([loadShares(), loadDav()])}
+            disabled={loading}
+          >
+            <RefreshCw className={loading ? "spin" : ""} />
+            <span>새로고침</span>
+          </button>
+        </div>
       </header>
       <div className="section-tabs">
         <button
@@ -588,6 +592,7 @@ export function SharesPage({
                       <input
                         type="password"
                         autoComplete="new-password"
+                        minLength={12}
                         maxLength={72}
                         value={sharePassword}
                         onChange={(event) => setSharePassword(event.target.value)}

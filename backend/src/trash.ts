@@ -698,11 +698,11 @@ export function createTrashRouter(): express.Router {
         trashed_at+INTERVAL '${TRASH_RETENTION_DAYS} days' AS "expiresAt",
         (SELECT COUNT(*)::integer FROM files WHERE user_id=folders.user_id AND trash_root_id=folders.id) AS "fileCount",
         (SELECT COUNT(*)::integer FROM folders child WHERE child.user_id=folders.user_id AND child.trash_root_id=folders.id) AS "folderCount",
-        COALESCE((SELECT SUM(size_bytes) FROM files WHERE user_id=folders.user_id AND trash_root_id=folders.id),0)::text AS "sizeBytes"
+        COALESCE((SELECT SUM(size_bytes) FROM files WHERE user_id=folders.user_id AND trash_root_id=folders.id),0)::text AS "sizeBytes",NULL::text AS "mimeType"
       FROM folders WHERE user_id=$1 AND trashed_at IS NOT NULL AND trash_root_id=id
       UNION ALL
       SELECT id,'file'::text AS type,stored_name AS name,original_created_at AS "originalCreatedAt",client_last_modified AS "originalModifiedAt",trashed_at AS "trashedAt",
-        trashed_at+INTERVAL '${TRASH_RETENTION_DAYS} days' AS "expiresAt",1::integer AS "fileCount",0::integer AS "folderCount",size_bytes::text AS "sizeBytes"
+        trashed_at+INTERVAL '${TRASH_RETENTION_DAYS} days' AS "expiresAt",1::integer AS "fileCount",0::integer AS "folderCount",size_bytes::text AS "sizeBytes",mime_type AS "mimeType"
       FROM files WHERE user_id=$1 AND trashed_at IS NOT NULL AND trash_root_id=id
       ORDER BY "trashedAt" DESC
     `, [req.user!.id]);

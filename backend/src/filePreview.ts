@@ -111,6 +111,10 @@ export function previewKind(name: string, mimeType = ''): PreviewKind {
   return 'unsupported';
 }
 
+export function isStreamPreviewKind(kind: PreviewKind): boolean {
+  return kind === 'image' || kind === 'video' || kind === 'audio' || kind === 'pdf';
+}
+
 export function normalizeEncoding(value: unknown): string {
   const normalized = ENCODING_ALIASES[String(value ?? '').trim().toLowerCase()];
   if (!normalized || !iconv.encodingExists(normalized)) throw new PreviewError(400, 'Unsupported text encoding');
@@ -299,7 +303,7 @@ async function sendFilePreview(req: Request, res: Response, trashed: boolean): P
       : undefined;
     return { file, kind, siblingRows, text };
   });
-  const streamUrl = kind === 'image' || kind === 'video' || kind === 'audio' || kind === 'pdf'
+  const streamUrl = isStreamPreviewKind(kind)
     ? `/api/previews/${encodeURIComponent(previewToken({ id: file.id, userId: req.user!.id, sha256: file.sha256, authVersion: req.user!.authVersion }, 'preview', trashed))}`
     : undefined;
   const subtitles = kind === 'video' || kind === 'audio'
@@ -309,6 +313,29 @@ async function sendFilePreview(req: Request, res: Response, trashed: boolean): P
     : [];
   res.setHeader('Cache-Control', 'private, no-store');
   res.json({ file: { ...file, kind, encoding: text?.encoding, hasBom: text?.hasBom, streamUrl }, siblings: siblingRows, subtitles, encodings: SUPPORTED_TEXT_ENCODINGS });
+}
+
+async function sendPreviewTicket(req: Request, res: Response, trashed: boolean): Promise<void> {
+  const file = await withUserReadLock(req.user!.id, async (client) => {
+    const result = await client.query(`
+      SELECT id,user_id AS "userId",stored_name AS name,mime_type AS "mimeType",sha256
+      FROM files
+      WHERE id=$1 AND user_id=$2 AND trashed_at ${trashed ? 'IS NOT NULL' : 'IS NULL'}
+    `, [String(req.params.id), req.user!.id]);
+    if (!result.rowCount) throw new PreviewError(404, 'File not found');
+    return result.rows[0];
+  });
+  const kind = previewKind(file.name, file.mimeType);
+  if (!isStreamPreviewKind(kind))
+    throw new PreviewError(415, 'This file cannot be streamed inline');
+  const url = `/api/previews/${encodeURIComponent(previewToken({
+    id: file.id,
+    userId: file.userId,
+    sha256: file.sha256,
+    authVersion: req.user!.authVersion,
+  }, 'preview', trashed))}`;
+  res.setHeader('Cache-Control', 'private, no-store');
+  res.status(201).json({ url });
 }
 
 async function sendFileText(req: Request, res: Response, trashed: boolean): Promise<void> {
@@ -353,6 +380,8 @@ export function createFilePreviewRouter(): express.Router {
 
   router.get('/api/files/:id/preview', requireAuth, asyncRoute((req, res) => sendFilePreview(req, res, false)));
   router.get('/api/trash/files/:id/preview', requireAuth, asyncRoute((req, res) => sendFilePreview(req, res, true)));
+  router.post('/api/files/:id/preview-ticket', requireAuth, asyncRoute((req, res) => sendPreviewTicket(req, res, false)));
+  router.post('/api/trash/files/:id/preview-ticket', requireAuth, asyncRoute((req, res) => sendPreviewTicket(req, res, true)));
 
   router.post('/api/files/:id/download-ticket', requireAuth, asyncRoute(async (req, res) => {
     const file = await withUserReadLock(req.user!.id, (client) => ownedFile(String(req.params.id), req.user!.id, client));
@@ -629,7 +658,7 @@ export function createFilePreviewRouter(): express.Router {
       client.release();
     }
     const kind = previewKind(file.name, file.mimeType);
-    if (identity.mode === 'preview' && kind !== 'image' && kind !== 'video' && kind !== 'audio' && kind !== 'pdf') {
+    if (identity.mode === 'preview' && !isStreamPreviewKind(kind)) {
       await fileHandle!.close();
       throw new PreviewError(415, 'This file cannot be streamed inline');
     }

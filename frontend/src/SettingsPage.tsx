@@ -51,7 +51,7 @@ export function SettingsPage({
     displayName: "",
     password: "",
     isAdmin: false,
-    quotaGb: "",
+    quotaGb: "10",
   });
   const [busy, setBusy] = useState(false);
 
@@ -178,7 +178,7 @@ export function SettingsPage({
         displayName: "",
         password: "",
         isAdmin: false,
-        quotaGb: "",
+        quotaGb: "10",
       });
       setShowCreate(false);
       await loadAdmin();
@@ -254,12 +254,14 @@ export function SettingsPage({
           <h1>설정</h1>
           <p>내 계정 보안과 OriginVault 운영 정책을 관리합니다.</p>
         </div>
-        <div className="identity-badge">
-          <div>{user.displayName[0]?.toUpperCase()}</div>
-          <span>
-            <strong>{user.displayName}</strong>
-            <small>{user.isAdmin ? "Administrator" : "Member"}</small>
-          </span>
+        <div className="page-actions page-identity">
+          <div className="identity-badge">
+            <div>{user.displayName[0]?.toUpperCase()}</div>
+            <span>
+              <strong>{user.displayName}</strong>
+              <small>{user.isAdmin ? "Administrator" : "Member"}</small>
+            </span>
+          </div>
         </div>
       </header>
       <div className="section-tabs">
@@ -336,7 +338,7 @@ export function SettingsPage({
                   autoComplete="new-password"
                   value={newPassword}
                   onChange={(event) => setNewPassword(event.target.value)}
-                  minLength={8}
+                  minLength={12}
                   required
                 />
               </label>
@@ -488,7 +490,7 @@ export function SettingsPage({
                     onChange={(event) =>
                       setNewUser({ ...newUser, password: event.target.value })
                     }
-                    minLength={8}
+                    minLength={12}
                     required
                   />
                 </label>

@@ -21,14 +21,50 @@ import { shareRouter } from './shares.js';
 import { webdavManagementRouter, webdavRouter } from './webdav.js';
 import { filePreviewRouter } from './filePreview.js';
 import { reconcileMutationJournals } from './mutationJournal.js';
+import { createRateLimiter } from './rateLimit.js';
 import { migrateLegacyTrashStorage, purgeExpiredTrash, TrashError, trashRouter, trashSelections } from './trash.js';
 
 const app = express();
+const registrationRateLimit = createRateLimiter({ windowMs: 60 * 60 * 1_000, max: 5 });
+const loginRateLimit = createRateLimiter({ windowMs: 15 * 60 * 1_000, max: 10 });
+const webdavRateLimit = createRateLimiter({ windowMs: 60 * 1_000, max: 600 });
+
+function isPrivateLanOrigin(origin: string): boolean {
+  try {
+    const url = new URL(origin);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    const hostname = url.hostname.toLowerCase();
+    if (hostname === 'localhost' || hostname === '::1') return true;
+    const octets = hostname.split('.').map(Number);
+    if (octets.length !== 4 || octets.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) return false;
+    const [first = -1, second = -1] = octets;
+    return first === 10
+      || first === 127
+      || (first === 172 && second >= 16 && second <= 31)
+      || (first === 192 && second === 168);
+  } catch {
+    return false;
+  }
+}
+
+function isAllowedBrowserOrigin(origin: string | undefined): boolean {
+  if (!origin || config.corsAllowedOrigins.includes(origin)) return true;
+  return !config.publicUrl && isPrivateLanOrigin(origin);
+}
+
 app.set('trust proxy', ['loopback', 'linklocal', 'uniquelocal']);
+app.use((req, res, next) => {
+  const origin = req.header('origin');
+  if (!isAllowedBrowserOrigin(origin)) {
+    res.status(403).json({ error: 'Request origin is not allowed' });
+    return;
+  }
+  next();
+});
 app.use(requestLogging);
-app.use('/webdav', webdavRouter);
+app.use('/webdav', webdavRateLimit, webdavRouter);
 app.use(cors({
-  origin: true,
+  origin: (origin, callback) => callback(null, isAllowedBrowserOrigin(origin)),
   credentials: true,
   exposedHeaders: ['ETag', 'X-Source-Encoding', 'X-Source-BOM', 'X-Content-SHA256', 'Content-Range'],
 }));
@@ -101,7 +137,7 @@ async function ensureFolderPath(user: SessionUser, baseFolderId: string | null, 
   return { folderId: parentId, relativePath: parentPath };
 }
 
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', registrationRateLimit, async (req, res) => {
   let username: string;
   let password: string;
   let displayName: string;
@@ -119,21 +155,16 @@ app.post('/api/auth/register', async (req, res) => {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['originvault:registration']);
     const setting = await client.query<{ registration_enabled: boolean }>('SELECT registration_enabled FROM app_settings WHERE id=1 FOR UPDATE');
-    const count = await client.query<{ count: string; active_admins: string }>(`
-      SELECT COUNT(*)::text AS count,
-        COUNT(*) FILTER(WHERE is_admin=true AND disabled_at IS NULL)::text AS active_admins
-      FROM users
-    `);
+    const count = await client.query<{ count: string }>('SELECT COUNT(*)::text AS count FROM users');
     const isFirstUser = count.rows[0]!.count === '0';
-    const bootstrapAdmin = count.rows[0]!.active_admins === '0';
-    if (!bootstrapAdmin && !setting.rows[0]!.registration_enabled) {
+    if (!isFirstUser && !setting.rows[0]!.registration_enabled) {
       await client.query('ROLLBACK');
       return res.status(403).json({ error: 'Registration is currently disabled' });
     }
     const result = await client.query<{ id: string; storage_key: string }>(`
-      INSERT INTO users(username,display_name,storage_key,password_hash,is_admin)
-      VALUES($1,$2,$1,$3,$4) RETURNING id,storage_key
-    `, [username, displayName, passwordHash, isFirstUser || bootstrapAdmin]);
+      INSERT INTO users(username,display_name,storage_key,password_hash,is_admin,storage_quota_bytes)
+      VALUES($1,$2,$1,$3,$4,$5) RETURNING id,storage_key
+    `, [username, displayName, passwordHash, isFirstUser, config.defaultStorageQuotaBytes]);
     await mkdir(userFilesRoot(result.rows[0]!.storage_key), { recursive: true });
     await client.query('COMMIT');
     const user = await loadSessionUser(result.rows[0]!.id);
@@ -150,7 +181,7 @@ app.post('/api/auth/register', async (req, res) => {
   } finally { client.release(); }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', loginRateLimit, async (req, res) => {
   const username = String(req.body.username ?? '').toLowerCase().trim();
   logForRequest(req).trace({ event: 'login_requested', username }, 'Login requested');
   const result = await db.query('SELECT id,username,password_hash,disabled_at FROM users WHERE username=$1', [username]);
@@ -516,13 +547,23 @@ app.use((error: any, _req: express.Request, res: express.Response, _next: expres
   }
   if (error?.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'File is too large' });
   if (error instanceof StorageQuotaError) return res.status(507).json({ error: error.message });
-  return res.status(500).json({ error: error instanceof Error ? error.message : 'Internal server error' });
+  return res.status(500).json({ error: 'Internal server error' });
 });
 
 async function start(): Promise<void> {
-  if (config.jwtSecret.length < 32 || config.jwtSecret.includes('development-only') || config.jwtSecret.startsWith('change-this')) throw new Error('JWT_SECRET must be set to a strong random value');
-  if (config.shareSecret.length < 32 || config.shareSecret.includes('development-only') || config.shareSecret.startsWith('change-this')) throw new Error('SHARE_SECRET must be set to a strong random value');
+  const unsafeSecret = (value: string) => value.length < 32 || /development|change|replace|example/i.test(value);
+  if (unsafeSecret(config.jwtSecret)) throw new Error('JWT_SECRET must be set to a strong random value');
+  if (unsafeSecret(config.shareSecret)) throw new Error('SHARE_SECRET must be set to a strong random value');
+  if (config.legacyShareSecret && unsafeSecret(config.legacyShareSecret)) throw new Error('LEGACY_SHARE_SECRET must be a strong random value when set');
+  if (config.jwtSecret === config.shareSecret) throw new Error('JWT_SECRET and SHARE_SECRET must be different values');
   if (!Number.isSafeInteger(config.maxUploadBytes) || config.maxUploadBytes < 0) throw new Error('MAX_UPLOAD_BYTES must be a non-negative safe integer');
+  if (!/^\d+$/.test(config.defaultStorageQuotaBytes)) throw new Error('DEFAULT_STORAGE_QUOTA_BYTES must be a non-negative integer');
+  if (process.env.NODE_ENV === 'production' && config.publicUrl) {
+    let publicUrl: URL;
+    try { publicUrl = new URL(config.publicUrl); } catch { throw new Error('PUBLIC_URL must be an absolute HTTPS URL in production'); }
+    if (publicUrl.protocol !== 'https:' || publicUrl.pathname !== '/' || publicUrl.search || publicUrl.hash)
+      throw new Error('PUBLIC_URL must be an HTTPS origin without a path, query, or fragment in production');
+  }
   logger.info({ event: 'service_starting', port: config.port, dataRoot: config.dataRoot, logDir: config.logDir, logLevel: config.logLevel, logRetentionDays: config.logRetentionDays, maxUploadBytes: config.maxUploadBytes }, 'OriginVault backend starting');
   await mkdir(config.dataRoot, { recursive: true });
   logger.debug({ event: 'data_root_ready', dataRoot: config.dataRoot }, 'Data root is ready');

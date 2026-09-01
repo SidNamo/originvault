@@ -19,7 +19,7 @@ import {
   removeMutationJournal,
   writeMutationJournal,
 } from './mutationJournal.js';
-import { assertStorageAvailable, getStorageUsage, StorageQuotaError } from './quota.js';
+import { assertStorageAvailable, getStorageUsage, StorageQuotaError, type StorageUsage } from './quota.js';
 import { extractMetadata, isHiddenResource, originalCreatedAtFromMetadata, resolveInside, safeSegment, userFilesRoot } from './storage.js';
 import { pruneEmptyActiveFolders, removeEmptyActiveFolderPaths } from './folderCleanup.js';
 import { moveSelectionsToTrash } from './trash.js';
@@ -100,6 +100,16 @@ export function webdavContentType(requested: string | undefined, metadata: Recor
     return extractedMimeType ?? requestedMimeType ?? 'application/octet-stream';
   }
   return requestedMimeType;
+}
+
+export function webdavQuota(usage: Pick<StorageUsage, 'usedBytes' | 'reservedBytes' | 'quotaBytes'>): { usedBytes: string; availableBytes: string } | null {
+  if (usage.quotaBytes === null) return null;
+  const usedBytes = BigInt(usage.usedBytes) + BigInt(usage.reservedBytes);
+  const availableBytes = BigInt(usage.quotaBytes) - usedBytes;
+  return {
+    usedBytes: usedBytes.toString(),
+    availableBytes: (availableBytes > 0n ? availableBytes : 0n).toString(),
+  };
 }
 
 async function syncRenameDirectories(sourcePath: string, targetPath: string): Promise<void> {
@@ -239,7 +249,7 @@ export function webdavHref(segments: string[], collection: boolean): string {
   return `/webdav/${encoded}${collection && encoded ? '/' : ''}`;
 }
 
-function propertyResponse(resource: DavResource, segments: string[]): string {
+function propertyResponse(resource: DavResource, segments: string[], quota?: { usedBytes: string; availableBytes: string } | null): string {
   const collection = resource.type === 'folder';
   const modified = new Date(resource.modifiedAt).toUTCString();
   const created = new Date(resource.createdAt).toISOString();
@@ -247,6 +257,7 @@ function propertyResponse(resource: DavResource, segments: string[]): string {
     + `<D:displayname>${xml(resource.name)}</D:displayname>`
     + `<D:resourcetype>${collection ? '<D:collection/>' : ''}</D:resourcetype>`
     + `<D:creationdate>${xml(created)}</D:creationdate><D:getlastmodified>${xml(modified)}</D:getlastmodified>`
+    + (collection && quota ? `<D:quota-used-bytes>${xml(quota.usedBytes)}</D:quota-used-bytes><D:quota-available-bytes>${xml(quota.availableBytes)}</D:quota-available-bytes>` : '')
     + (collection ? '' : `<D:getcontentlength>${xml(resource.sizeBytes)}</D:getcontentlength><D:getcontenttype>${xml(resource.mimeType)}</D:getcontenttype><D:getetag>"sha256-${xml(resource.sha256)}"</D:getetag>`)
     + `</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
 }
@@ -260,7 +271,8 @@ async function handlePropfind(req: Request, res: Response, identity: DavIdentity
   if (!resource) throw new DavError(404, 'Resource not found');
   const depth = req.header('depth') ?? '1';
   if (depth !== '0' && depth !== '1') throw new DavError(403, 'Only Depth 0 and 1 are supported');
-  const responses = [propertyResponse(resource, segments)];
+  const quota = resource.type === 'folder' ? webdavQuota(await getStorageUsage(identity.userId)) : null;
+  const responses = [propertyResponse(resource, segments, quota)];
   if (depth === '1' && resource.type === 'folder') {
     const [folders, files] = await Promise.all([
       db.query(`SELECT id,name,relative_path AS "relativePath",created_at AS "createdAt",modified_at AS "modifiedAt" FROM folders WHERE user_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND trashed_at IS NULL ORDER BY name`, [identity.userId, resource.folderId]),

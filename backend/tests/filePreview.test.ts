@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   detectTextEncodingFromBytes,
   isEditableTextFile,
+  isStreamPreviewKind,
   normalizeEncoding,
   previewKind,
   SUPPORTED_TEXT_ENCODINGS,
@@ -19,6 +20,10 @@ test('preview classification is case-insensitive and broad', () => {
   assert.equal(previewKind('TRACK.FLAC'), 'audio');
   assert.equal(previewKind('DOCUMENT.PDF'), 'pdf');
   assert.equal(previewKind('archive.ZIP'), 'unsupported');
+  for (const kind of ['image', 'video', 'audio', 'pdf'] as const)
+    assert.equal(isStreamPreviewKind(kind), true);
+  for (const kind of ['text', 'subtitle', 'unsupported'] as const)
+    assert.equal(isStreamPreviewKind(kind), false);
 });
 
 test('the editor exposes unicode and common legacy encodings', () => {

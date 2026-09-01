@@ -1,4 +1,4 @@
-import pg from 'pg';
+import pg, { type PoolClient } from 'pg';
 import { config } from './config.js';
 import { logger } from './logger.js';
 
@@ -8,10 +8,15 @@ db.on('connect', () => logger.debug({ event: 'database_connection_opened' }, 'Po
 db.on('remove', () => logger.debug({ event: 'database_connection_closed' }, 'PostgreSQL connection closed'));
 db.on('error', (error) => logger.error({ event: 'database_pool_error', err: error }, 'Unexpected PostgreSQL pool error'));
 
-export async function migrate(): Promise<void> {
-  const startedAt = process.hrtime.bigint();
-  logger.info({ event: 'database_migration_started' }, 'Database migration started');
-  await db.query(`
+type Migration = {
+  version: string;
+  up: (client: PoolClient) => Promise<void>;
+};
+
+const migrations: Migration[] = [{
+  version: '20260901_001_initial_schema',
+  up: async (client) => {
+    await client.query(`
     CREATE EXTENSION IF NOT EXISTS pgcrypto;
     CREATE TABLE IF NOT EXISTS schema_migrations (
       version text PRIMARY KEY,
@@ -39,20 +44,13 @@ export async function migrate(): Promise<void> {
     ALTER TABLE users ALTER COLUMN display_name SET NOT NULL;
     ALTER TABLE users ALTER COLUMN storage_key SET NOT NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS users_storage_key_unique ON users(storage_key);
-    DO $$
-    BEGIN
-      IF NOT EXISTS (SELECT 1 FROM users WHERE is_admin AND disabled_at IS NULL) THEN
-        UPDATE users SET is_admin=true
-        WHERE id=(SELECT id FROM users WHERE disabled_at IS NULL ORDER BY created_at,id LIMIT 1);
-      END IF;
-    END $$;
     CREATE TABLE IF NOT EXISTS app_settings (
       id smallint PRIMARY KEY CHECK (id=1),
-      registration_enabled boolean NOT NULL DEFAULT true,
+      registration_enabled boolean NOT NULL DEFAULT false,
       updated_at timestamptz NOT NULL DEFAULT now(),
       updated_by uuid REFERENCES users(id) ON DELETE SET NULL
     );
-    INSERT INTO app_settings(id,registration_enabled) VALUES(1,true) ON CONFLICT(id) DO NOTHING;
+    INSERT INTO app_settings(id,registration_enabled) VALUES(1,false) ON CONFLICT(id) DO NOTHING;
     CREATE TABLE IF NOT EXISTS folders (
       id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -238,6 +236,44 @@ export async function migrate(): Promise<void> {
       created_at timestamptz NOT NULL DEFAULT now()
     );
     CREATE INDEX IF NOT EXISTS webdav_tokens_user_created_idx ON webdav_tokens(user_id,created_at DESC);
+    `);
+  },
+}];
+
+async function ensureMigrationTable(client: PoolClient): Promise<void> {
+  await client.query(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version text PRIMARY KEY,
+      applied_at timestamptz NOT NULL DEFAULT now()
+    );
   `);
+}
+
+export async function migrate(): Promise<void> {
+  const startedAt = process.hrtime.bigint();
+  const client = await db.connect();
+  logger.info({ event: 'database_migration_started' }, 'Database migration started');
+  try {
+    await client.query("SELECT pg_advisory_lock(hashtext('originvault:schema-migrations'))");
+    await ensureMigrationTable(client);
+    const applied = await client.query<{ version: string }>('SELECT version FROM schema_migrations');
+    const appliedVersions = new Set(applied.rows.map((entry) => entry.version));
+    for (const migration of migrations) {
+      if (appliedVersions.has(migration.version)) continue;
+      await client.query('BEGIN');
+      try {
+        await migration.up(client);
+        await client.query('INSERT INTO schema_migrations(version) VALUES($1)', [migration.version]);
+        await client.query('COMMIT');
+        logger.info({ event: 'database_migration_applied', version: migration.version }, 'Database migration applied');
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        throw error;
+      }
+    }
+  } finally {
+    await client.query("SELECT pg_advisory_unlock(hashtext('originvault:schema-migrations'))").catch(() => undefined);
+    client.release();
+  }
   logger.info({ event: 'database_migration_completed', durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000 }, 'Database migration completed');
 }
