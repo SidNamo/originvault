@@ -211,6 +211,113 @@ const nameCollator = new Intl.Collator("ko", {
   numeric: true,
   sensitivity: "base",
 });
+type DashboardView = "files" | "shares" | "trash" | "settings";
+type DashboardNavigation = {
+  view: DashboardView;
+  folderPath: string[];
+  legacyFolderId?: string;
+};
+const dashboardViews = new Set<DashboardView>([
+  "files",
+  "shares",
+  "trash",
+  "settings",
+]);
+
+function dashboardNavigation(): DashboardNavigation {
+  let segments: string[] = [];
+  try {
+    segments = window.location.pathname
+      .split("/")
+      .filter(Boolean)
+      .map((segment) => decodeURIComponent(segment));
+  } catch {
+    /* Invalid URL encoding is canonicalized to the files root. */
+  }
+  const params = new URLSearchParams(window.location.search);
+  const requestedView = params.get("view") as DashboardView | null;
+  const pathView = dashboardViews.has(segments[0] as DashboardView)
+    ? segments[0] as DashboardView
+    : "files";
+  const view = requestedView && dashboardViews.has(requestedView)
+    ? requestedView
+    : pathView;
+  const legacyFolderId = view === "files"
+    ? params.get("folder")?.trim() || undefined
+    : undefined;
+  return {
+    view,
+    folderPath: view === "files" && pathView === "files" && segments[0] === "files"
+      ? segments.slice(1)
+      : [],
+    legacyFolderId,
+  };
+}
+
+function dashboardFolderTrail(
+  folders: VaultFolder[],
+  folderId: string,
+): VaultFolder[] | undefined {
+  const byId = new Map(folders.map((entry) => [entry.id, entry]));
+  const result: VaultFolder[] = [];
+  const visited = new Set<string>();
+  let current = byId.get(folderId);
+  if (!current) return;
+  while (current) {
+    if (visited.has(current.id)) return;
+    visited.add(current.id);
+    result.unshift(current);
+    if (!current.parentId) break;
+    current = byId.get(current.parentId);
+    if (!current) return;
+  }
+  return result;
+}
+
+function dashboardTrailFromPath(
+  folders: VaultFolder[],
+  path: string[],
+): VaultFolder[] | undefined {
+  const children = new Map<string | null, Map<string, VaultFolder>>();
+  for (const entry of folders) {
+    const byName = children.get(entry.parentId) ?? new Map<string, VaultFolder>();
+    byName.set(entry.name, entry);
+    children.set(entry.parentId, byName);
+  }
+  const result: VaultFolder[] = [];
+  let parentId: string | null = null;
+  for (const name of path) {
+    const current: VaultFolder | undefined = children.get(parentId)?.get(name);
+    if (!current) return;
+    result.push(current);
+    parentId = current.id;
+  }
+  return result;
+}
+
+function dashboardPath(view: DashboardView, folderNames: readonly string[]) {
+  if (view !== "files") return `/${view}`;
+  const suffix = folderNames
+    .map((name) => encodeURIComponent(name))
+    .join("/");
+  return suffix ? `/files/${suffix}` : "/files";
+}
+
+function writeDashboardNavigation(
+  view: DashboardView,
+  folderNames: readonly string[],
+  mode: "push" | "replace" = "push",
+) {
+  const next = `${dashboardPath(view, folderNames)}${window.location.hash}`;
+  const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (mode === "push" && next === current) return;
+  const previousState = window.history.state;
+  const state = typeof previousState === "object" && previousState
+    ? { ...previousState, originvault: true }
+    : { originvault: true };
+  if (mode === "replace") window.history.replaceState(state, "", next);
+  else window.history.pushState(state, "", next);
+}
 
 const readLegacyDirectory = async (
   entry: LegacyDirectoryEntry,
@@ -398,8 +505,9 @@ function Dashboard({
   onLogout: () => void;
 }) {
   const username = user.username;
-  const [activeView, setActiveView] = useState<"files" | "shares" | "trash" | "settings">(
-    "files",
+  const initialNavigation = useRef(dashboardNavigation()).current;
+  const [activeView, setActiveView] = useState<DashboardView>(
+    initialNavigation.view,
   );
   const [items, setItems] = useState<{
     folders: VaultFolder[];
@@ -407,6 +515,9 @@ function Dashboard({
   }>({ folders: [], files: [] });
   const [allFolders, setAllFolders] = useState<VaultFolder[]>([]);
   const [trail, setTrail] = useState<VaultFolder[]>([]);
+  const [navigationReady, setNavigationReady] = useState(
+    !initialNavigation.legacyFolderId && !initialNavigation.folderPath.length,
+  );
   const [previewFile, setPreviewFile] = useState<VaultFile>();
   const [notices, setNotices] = useState<Array<{ id: string; message: string }>>([]);
   const setMessage = useCallback((message: string) => {
@@ -497,6 +608,16 @@ function Dashboard({
   const collisionResolver = useRef<
     ((decisions: Map<string, CollisionChoice>) => void) | undefined
   >(undefined);
+  const trailRef = useRef(trail);
+  const allFoldersRef = useRef(allFolders);
+  const pendingFolderIdRef = useRef(initialNavigation.legacyFolderId);
+  const pendingFolderPathRef = useRef<string[] | undefined>(
+    initialNavigation.folderPath.length
+      ? initialNavigation.folderPath
+      : undefined,
+  );
+  trailRef.current = trail;
+  allFoldersRef.current = allFolders;
   const folder = trail.at(-1);
   const parentFolder = trail.length > 1 ? trail.at(-2) : undefined;
   const setFolderPicker = (element: HTMLInputElement | null) => {
@@ -528,26 +649,41 @@ function Dashboard({
     try {
       const folders = (await api.folderTree()).folders;
       if (sequence !== treeRequestSequence.current) return;
+      allFoldersRef.current = folders;
       setAllFolders(folders);
-      setTrail((previous) => {
-        const selectedId = previous.at(-1)?.id;
-        if (!selectedId) return previous;
-        const byId = new Map(folders.map((entry) => [entry.id, entry]));
-        const selected = byId.get(selectedId);
-        if (!selected) return [];
-        const next: VaultFolder[] = [];
-        let current: VaultFolder | undefined = selected;
-        while (current) {
-          next.unshift(current);
-          current = current.parentId ? byId.get(current.parentId) : undefined;
+      const requestedPath = pendingFolderPathRef.current;
+      const requestedId = pendingFolderIdRef.current;
+      const selectedId = requestedId ?? (
+        requestedPath ? undefined : trailRef.current.at(-1)?.id
+      );
+      pendingFolderIdRef.current = undefined;
+      pendingFolderPathRef.current = undefined;
+      if (requestedPath || selectedId) {
+        const next = requestedId
+          ? dashboardFolderTrail(folders, requestedId)
+          : requestedPath
+            ? dashboardTrailFromPath(folders, requestedPath)
+            : dashboardFolderTrail(folders, selectedId!);
+        trailRef.current = next ?? [];
+        setTrail(next ?? []);
+        const location = dashboardNavigation();
+        if (location.view === "files") {
+          writeDashboardNavigation(
+            "files",
+            next?.map((entry) => entry.name) ?? [],
+            "replace",
+          );
         }
-        return next;
-      });
+      }
     } catch (e) {
       if (sequence === treeRequestSequence.current)
         setMessage(e instanceof Error ? e.message : "폴더 트리 오류");
     } finally {
-      if (sequence === treeRequestSequence.current) setTreeRefreshing(false);
+      if (sequence === treeRequestSequence.current) {
+        setTreeRefreshing(false);
+        if (!pendingFolderIdRef.current && !pendingFolderPathRef.current)
+          setNavigationReady(true);
+      }
     }
   }, []);
   const refreshStorage = useCallback(async () => {
@@ -572,8 +708,8 @@ function Dashboard({
     void loadTree();
   }, [loadTree]);
   useEffect(() => {
-    void load();
-  }, [load]);
+    if (activeView === "files" && navigationReady) void load();
+  }, [activeView, load, navigationReady]);
   useEffect(() => {
     setSelectedKeys(new Set());
     selectionAnchor.current = undefined;
@@ -669,22 +805,94 @@ function Dashboard({
     [],
   );
 
-  const selectTreeFolder = useCallback(
-    (selected?: VaultFolder) => {
-      if (!selected) {
-        setTrail([]);
+  const navigateToTrail = useCallback((nextTrail: VaultFolder[]) => {
+    pendingFolderIdRef.current = undefined;
+    pendingFolderPathRef.current = undefined;
+    trailRef.current = nextTrail;
+    setNavigationReady(true);
+    setActiveView("files");
+    setTrail(nextTrail);
+    writeDashboardNavigation(
+      "files",
+      nextTrail.map((entry) => entry.name),
+    );
+  }, []);
+  const navigateToView = useCallback((view: DashboardView) => {
+    setActiveView(view);
+    if (view !== "files") {
+      pendingFolderIdRef.current = undefined;
+      pendingFolderPathRef.current = undefined;
+      setNavigationReady(true);
+      writeDashboardNavigation(view, []);
+      return;
+    }
+    if (pendingFolderIdRef.current) return;
+    writeDashboardNavigation(
+      "files",
+      pendingFolderPathRef.current ?? trailRef.current.map((entry) => entry.name),
+    );
+  }, []);
+  useEffect(() => {
+    if (initialNavigation.legacyFolderId) return;
+    writeDashboardNavigation(
+      initialNavigation.view,
+      initialNavigation.folderPath,
+      "replace",
+    );
+  }, [initialNavigation]);
+  useEffect(() => {
+    const restoreNavigation = () => {
+      const next = dashboardNavigation();
+      setActiveView(next.view);
+      if (next.view !== "files") {
+        pendingFolderIdRef.current = undefined;
+        pendingFolderPathRef.current = undefined;
+        setNavigationReady(true);
+        writeDashboardNavigation(next.view, [], "replace");
         return;
       }
-      const byId = new Map(allFolders.map((entry) => [entry.id, entry]));
-      const nextTrail: VaultFolder[] = [];
-      let current: VaultFolder | undefined = selected;
-      while (current) {
-        nextTrail.unshift(current);
-        current = current.parentId ? byId.get(current.parentId) : undefined;
+      if (!next.legacyFolderId && !next.folderPath.length) {
+        pendingFolderIdRef.current = undefined;
+        pendingFolderPathRef.current = undefined;
+        trailRef.current = [];
+        setNavigationReady(true);
+        setTrail([]);
+        writeDashboardNavigation("files", [], "replace");
+        return;
       }
-      setTrail(nextTrail);
+      const nextTrail = next.legacyFolderId
+        ? dashboardFolderTrail(allFoldersRef.current, next.legacyFolderId)
+        : dashboardTrailFromPath(allFoldersRef.current, next.folderPath);
+      if (nextTrail) {
+        pendingFolderIdRef.current = undefined;
+        pendingFolderPathRef.current = undefined;
+        trailRef.current = nextTrail;
+        setNavigationReady(true);
+        setTrail(nextTrail);
+        writeDashboardNavigation(
+          "files",
+          nextTrail.map((entry) => entry.name),
+          "replace",
+        );
+        return;
+      }
+      pendingFolderIdRef.current = next.legacyFolderId;
+      pendingFolderPathRef.current = next.folderPath.length
+        ? next.folderPath
+        : undefined;
+      setNavigationReady(false);
+      void loadTree();
+    };
+    window.addEventListener("popstate", restoreNavigation);
+    return () => window.removeEventListener("popstate", restoreNavigation);
+  }, [loadTree]);
+
+  const selectTreeFolder = useCallback(
+    (selected?: VaultFolder) => {
+      if (!selected) return navigateToTrail([]);
+      navigateToTrail(dashboardFolderTrail(allFolders, selected.id) ?? []);
     },
-    [allFolders],
+    [allFolders, navigateToTrail],
   );
 
   const chooseCollision = (choice: CollisionChoice, applyToAll: boolean) => {
@@ -2014,7 +2222,7 @@ function Dashboard({
     }
   };
   useEffect(() => {
-    if (activeView !== "files") return;
+    if (activeView !== "files" || !navigationReady) return;
     const handleShortcut = (event: KeyboardEvent) => {
       if (
         event.repeat ||
@@ -2055,6 +2263,7 @@ function Dashboard({
     fileClipboard,
     folder?.id,
     moveOpen,
+    navigationReady,
     previewFile,
     selections,
   ]);
@@ -2119,6 +2328,7 @@ function Dashboard({
       onDragEnter={(event) => {
         if (
           activeView !== "files" ||
+          !navigationReady ||
           !event.dataTransfer.types.includes("Files") ||
           event.dataTransfer.types.includes(INTERNAL_DRAG_TYPE)
         )
@@ -2129,6 +2339,7 @@ function Dashboard({
       onDragOver={(event) => {
         if (
           activeView !== "files" ||
+          !navigationReady ||
           !event.dataTransfer.types.includes("Files") ||
           event.dataTransfer.types.includes(INTERNAL_DRAG_TYPE)
         )
@@ -2147,6 +2358,7 @@ function Dashboard({
       onDrop={(event) => {
         if (
           activeView !== "files" ||
+          !navigationReady ||
           !event.dataTransfer.types.includes("Files") ||
           event.dataTransfer.types.includes(INTERNAL_DRAG_TYPE)
         )
@@ -2168,6 +2380,7 @@ function Dashboard({
           return;
         if (
           activeView === "files" &&
+          navigationReady &&
           target.closest(".files-section, .breadcrumbs")
         ) {
           setContextMenu({
@@ -2202,28 +2415,28 @@ function Dashboard({
         <nav className="primary-nav" aria-label="대메뉴">
           <button
             className={activeView === "files" ? "active" : ""}
-            onClick={() => setActiveView("files")}
+            onClick={() => navigateToView("files")}
           >
             <FilesIcon />
             <span>내 파일</span>
           </button>
           <button
             className={activeView === "trash" ? "active" : ""}
-            onClick={() => setActiveView("trash")}
+            onClick={() => navigateToView("trash")}
           >
             <Trash2 />
             <span>휴지통</span>
           </button>
           <button
             className={activeView === "shares" ? "active" : ""}
-            onClick={() => setActiveView("shares")}
+            onClick={() => navigateToView("shares")}
           >
             <Share2 />
             <span>공유</span>
           </button>
           <button
             className={activeView === "settings" ? "active" : ""}
-            onClick={() => setActiveView("settings")}
+            onClick={() => navigateToView("settings")}
           >
             <Settings />
             <span>설정</span>
@@ -2238,7 +2451,6 @@ function Dashboard({
             selectedId={folder?.id}
             onSelect={(selected) => {
               selectTreeFolder(selected);
-              setActiveView("files");
               setMobileTreeOpen(false);
               window.requestAnimationFrame(() => {
                 if (mobileTreeToggle.current?.offsetParent)
@@ -2301,7 +2513,25 @@ function Dashboard({
             </div>
           ))}
         </div>
-        {activeView === "files" && (
+        {activeView === "files" && !navigationReady && (
+          <section className="workspace-page files-page" aria-busy="true">
+            <div className="empty">
+              <div>
+                <RefreshCw className={treeRefreshing ? "spin" : ""} />
+              </div>
+              <h3>폴더 위치를 복원하고 있습니다</h3>
+              <p>저장된 폴더 경로를 확인한 뒤 파일 목록을 표시합니다.</p>
+              <button
+                className="secondary"
+                disabled={treeRefreshing}
+                onClick={() => void loadTree()}
+              >
+                {treeRefreshing ? "불러오는 중" : "다시 시도"}
+              </button>
+            </div>
+          </section>
+        )}
+        {activeView === "files" && navigationReady && (
           <section className="workspace-page files-page">
             <header className="page-hero">
               <div>
@@ -2359,11 +2589,11 @@ function Dashboard({
             </header>
             {folder && (
               <div className="breadcrumbs">
-                <button onClick={() => setTrail([])}>내 파일</button>
+                <button onClick={() => navigateToTrail([])}>내 파일</button>
                 {trail.map((part, i) => (
                   <span key={part.id}>
                     <ChevronRight />
-                    <button onClick={() => setTrail(trail.slice(0, i + 1))}>
+                    <button onClick={() => navigateToTrail(trail.slice(0, i + 1))}>
                       {part.name}
                     </button>
                   </span>
@@ -2433,7 +2663,7 @@ function Dashboard({
                     <button
                       type="button"
                       className={`parent-folder-card ${dropTarget === "parent" ? "drop-target" : ""}`}
-                      onClick={() => setTrail(trail.slice(0, -1))}
+                      onClick={() => navigateToTrail(trail.slice(0, -1))}
                       onDragOver={(event) => markDropTarget(event, "parent")}
                       onDragLeave={(event) => clearDropTarget(event, "parent")}
                       onDrop={(event) => handleDropAt(event, parentFolder)}
@@ -2481,7 +2711,7 @@ function Dashboard({
                         onDoubleClick={(event) => {
                           if ((event.target as HTMLElement).closest("button"))
                             return;
-                          setTrail([...trail, item]);
+                          navigateToTrail([...trail, item]);
                         }}
                         onContextMenu={(event) =>
                           handleItemContextMenu(
@@ -2670,13 +2900,13 @@ function Dashboard({
           />
         )}
       </main>
-      {activeView === "files" && externalDropActive && (
+      {activeView === "files" && navigationReady && externalDropActive && (
         <div className="external-upload-overlay" aria-hidden="true">
           <Upload />
           <strong>이 폴더로 업로드</strong>
         </div>
       )}
-      {activeView === "files" && contextMenu && (
+      {activeView === "files" && navigationReady && contextMenu && (
         <div
           ref={contextMenuRef}
           className="item-context-menu"
@@ -2805,7 +3035,9 @@ function Dashboard({
               <button
                 role="menuitem"
                 onClick={() =>
-                  runContextAction(() => setTrail([...trail, contextMenu.item]))
+                  runContextAction(() =>
+                    navigateToTrail([...trail, contextMenu.item])
+                  )
                 }
               >
                 <FolderOpen />
@@ -3015,7 +3247,7 @@ function Dashboard({
           )}
         </div>
       )}
-      {activeView === "files" && detailTarget && (
+      {activeView === "files" && navigationReady && detailTarget && (
         <div
           className="drawer-backdrop"
           role="presentation"
@@ -3117,7 +3349,7 @@ function Dashboard({
           </aside>
         </div>
       )}
-      {activeView === "files" && folderDetailTarget && (
+      {activeView === "files" && navigationReady && folderDetailTarget && (
         <div
           className="drawer-backdrop"
           role="presentation"
@@ -3205,7 +3437,7 @@ function Dashboard({
                   className="primary"
                   onClick={() => {
                     closeFolderDetails();
-                    setTrail([...trail, folderDetailTarget]);
+                    navigateToTrail([...trail, folderDetailTarget]);
                   }}
                 >
                   <FolderOpen />
@@ -3216,7 +3448,7 @@ function Dashboard({
           </aside>
         </div>
       )}
-      {activeView === "files" && previewFile && (
+      {activeView === "files" && navigationReady && previewFile && (
         <PreviewViewer
           file={previewFile}
           onNavigate={setPreviewFile}
@@ -3226,7 +3458,7 @@ function Dashboard({
           onMessage={setMessage}
         />
       )}{" "}
-      {activeView === "files" && moveOpen && (
+      {activeView === "files" && navigationReady && moveOpen && (
         <MoveDialog
           folders={allFolders}
           destinationId={moveDestination}
@@ -3246,7 +3478,7 @@ function Dashboard({
           onChoose={chooseCollision}
         />
       )}
-      {activeView === "files" && shareDialogTarget && (
+      {activeView === "files" && navigationReady && shareDialogTarget && (
         <ShareDialog
           item={shareDialogTarget}
           busy={bulkBusy}
@@ -3323,13 +3555,35 @@ function PrivateApp() {
 }
 
 export default function App() {
+  useLayoutEffect(() => {
+    const currentPath = window.location.pathname;
+    const publicShare = currentPath.match(/^\/s\/([^/]+)\/*$/);
+    const navigation = publicShare ? undefined : dashboardNavigation();
+    const pathname = publicShare
+      ? currentPath.replace(/\/+$/, "")
+      : navigation?.legacyFolderId
+        ? "/files"
+        : dashboardPath(
+          navigation?.view ?? "files",
+          navigation?.folderPath ?? [],
+        );
+    const search = navigation?.legacyFolderId ? window.location.search : "";
+    const next = `${pathname}${search}${window.location.hash}`;
+    const current = `${currentPath}${window.location.search}${window.location.hash}`;
+    if (next === current) return;
+    const previousState = window.history.state;
+    const state = typeof previousState === "object" && previousState
+      ? previousState
+      : {};
+    window.history.replaceState(state, "", next);
+  }, []);
   useEffect(() => {
     const preventNativeContextMenu = (event: MouseEvent) => event.preventDefault();
     document.addEventListener("contextmenu", preventNativeContextMenu, true);
     return () =>
       document.removeEventListener("contextmenu", preventNativeContextMenu, true);
   }, []);
-  const match = window.location.pathname.match(/^\/s\/([^/]+)\/?$/);
+  const match = window.location.pathname.match(/^\/s\/([^/]+)\/*$/);
   return match ? (
     <PublicSharePage token={decodeURIComponent(match[1]!)} />
   ) : (

@@ -53,6 +53,8 @@ export function LazyFileThumbnail({
   const [nearViewport, setNearViewport] = useState(false);
   const [ticket, setTicket] = useState<{ key: string; url: string }>();
   const resourceKey = `${source}:${shareToken ?? ""}:${fileId}:${version}`;
+  const [failedResourceKey, setFailedResourceKey] = useState<string>();
+  const previewFailed = failedResourceKey === resourceKey;
   const previewUrl = ticket?.key === resourceKey ? ticket.url : "";
   const previewable = kind === "image" || kind === "video";
   const nativeOnlyImage = kind === "image" && (
@@ -94,10 +96,21 @@ export function LazyFileThumbnail({
   const videoUrl = nearViewport && kind === "video" ? previewUrl : undefined;
   return (
     <div ref={containerRef} className="file-preview-thumb" aria-hidden="true">
-      {(imageUrl || nativeImageUrl) && kind === "image" ? (
-        <img src={imageUrl || nativeImageUrl} alt="" />
-      ) : videoUrl ? (
-        <video src={videoUrl} muted playsInline preload="metadata" />
+      {!previewFailed && (imageUrl || nativeImageUrl) && kind === "image" ? (
+        <img
+          src={imageUrl || nativeImageUrl}
+          alt=""
+          draggable={false}
+          onError={() => setFailedResourceKey(resourceKey)}
+        />
+      ) : !previewFailed && videoUrl ? (
+        <video
+          src={videoUrl}
+          muted
+          playsInline
+          preload="metadata"
+          onError={() => setFailedResourceKey(resourceKey)}
+        />
       ) : (
         <Fallback size={36} />
       )}
