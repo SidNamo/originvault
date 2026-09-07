@@ -136,6 +136,7 @@ export async function extractMetadata(filePath: string): Promise<Record<string, 
   try {
     const { stdout } = await execFileAsync('exiftool', ['-json', '-G1', '-n', filePath], {
       maxBuffer: 10 * 1024 * 1024,
+      timeout: 30_000,
     });
     const parsed = JSON.parse(stdout) as Record<string, unknown>[];
     const metadata = parsed[0] ?? {};

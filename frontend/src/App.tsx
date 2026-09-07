@@ -65,7 +65,10 @@ import { PreviewViewer } from "./PreviewViewer";
 import { ShareDialog } from "./ShareDialog";
 import { CollisionDialog } from "./CollisionDialog";
 import { ListingControls, type ListingSortDirection, type ListingSortField, type ListingViewMode } from "./ListingControls";
-import { LazyFileThumbnail } from "./LazyFileThumbnail";
+import {
+  clearLazyFileThumbnailCache,
+  LazyFileThumbnail,
+} from "./LazyFileThumbnail";
 import { beginClipboardCopy, copyText } from "./clipboard";
 import { useMarqueeSelection } from "./useMarqueeSelection";
 import { VirtualizedFileGrid } from "./VirtualizedFileGrid";
@@ -3798,32 +3801,60 @@ function PrivateApp() {
   const [serverStorage, setServerStorage] = useState<ServerStorage | null>(null);
   const [checking, setChecking] = useState(Boolean(session.token));
   useEffect(() => {
-    const unsubscribe = session.subscribe((value) => {
+    const unsubscribe = session.subscribe((value, external) => {
+      clearLazyFileThumbnailCache();
       if (!value) {
         setUser(undefined);
         setChecking(false);
+        return;
       }
-    });
-    if (session.token)
+      if (!external) return;
+      setUser(undefined);
+      setChecking(true);
+      const expectedToken = value;
       void api
         .me()
         .then((result) => {
+          if (session.token !== expectedToken) return;
           setUser(result.user);
           setStorage(result.storage);
           setServerStorage(result.serverStorage ?? null);
         })
-        .finally(() => setChecking(false));
+        .catch(() => undefined)
+        .finally(() => {
+          if (session.token === expectedToken) setChecking(false);
+        });
+    });
+    if (session.token) {
+      const expectedToken = session.token;
+      void api
+        .me()
+        .then((result) => {
+          if (session.token !== expectedToken) return;
+          setUser(result.user);
+          setStorage(result.storage);
+          setServerStorage(result.serverStorage ?? null);
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          if (session.token === expectedToken) setChecking(false);
+        });
+    }
     return unsubscribe;
   }, []);
   const authenticated = async (nextUser: UserProfile) => {
+    const expectedToken = session.token;
     setUser(nextUser);
     try {
       const result = await api.me();
+      if (session.token !== expectedToken) return;
       setUser(result.user);
       setStorage(result.storage);
       setServerStorage(result.serverStorage ?? null);
+    } catch {
+      // The auth response already contains enough profile data to enter the app.
     } finally {
-      setChecking(false);
+      if (session.token === expectedToken) setChecking(false);
     }
   };
   if (checking)

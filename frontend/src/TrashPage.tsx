@@ -358,7 +358,7 @@ export function TrashPage({
           return <article data-trash-select-key={key} className={`trash-item ${selectedKeys.has(key) ? "selected" : ""}`} key={`${item.type}:${item.id}`} onClick={(event) => handleCardClick(key, event)} onDoubleClick={() => item.type === "folder"
             ? openFolder({ id: item.id, name: item.name, parentId: null, createdAt: item.trashedAt, modifiedAt: item.trashedAt, trashedAt: item.trashedAt })
             : openPreview(item)} onContextMenu={(event) => showMenu(event, action)}>
-            {viewMode === "preview" ? item.type === "folder" ? <div className="file-preview-thumb folder-thumb" aria-hidden="true"><Folder /></div> : <LazyFileThumbnail fileId={item.id} fileName={item.name} mimeType={item.mimeType ?? undefined} version={item.id} kind={item.mimeType?.startsWith("image/") ? "image" : item.mimeType?.startsWith("video/") ? "video" : "unsupported"} source="trash" fallback={Icon} /> : <div className="trash-kind"><Icon /></div>}
+            {viewMode === "preview" ? item.type === "folder" ? <div className="file-preview-thumb folder-thumb" aria-hidden="true"><Folder /></div> : <LazyFileThumbnail fileId={item.id} fileName={item.name} mimeType={item.mimeType ?? undefined} version={item.trashedAt} kind={item.mimeType?.startsWith("image/") ? "image" : item.mimeType?.startsWith("video/") ? "video" : "unsupported"} source="trash" fallback={Icon} /> : <div className="trash-kind"><Icon /></div>}
             <div className="trash-item-main">
               <strong>{item.name}</strong>
               <small>{item.type === "folder" ? `파일 ${item.fileCount.toLocaleString("ko-KR")}개 · 폴더 ${Math.max(0, item.folderCount - 1).toLocaleString("ko-KR")}개` : "파일"}{` · ${formatBytes(item.sizeBytes)}`}</small>

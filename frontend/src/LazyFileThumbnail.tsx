@@ -1,10 +1,111 @@
 import { useEffect, useRef, useState, type ComponentType } from "react";
 import { api } from "./api";
-import { usePausableImage } from "./usePausableImage";
+import {
+  clearPausableImageCache,
+  hasCachedPausableImage,
+  usePausableImage,
+} from "./usePausableImage";
 
 type ThumbnailSource = "files" | "trash" | "public";
+type PreviewTicket = { url: string; expiresAt: number };
+type ActivePreviewTicket = PreviewTicket & { key: string };
+type PendingPreviewTicket = {
+  generation: number;
+  controller: AbortController;
+  promise: Promise<PreviewTicket>;
+};
+const PREVIEW_TICKET_TTL_MS = 11 * 60 * 60 * 1_000;
+const PREVIEW_TICKET_REQUEST_TIMEOUT_MS = 30_000;
+const MAX_CACHED_PREVIEW_TICKETS = 5_000;
+const MAX_PENDING_PREVIEW_TICKETS = 256;
+const previewTickets = new Map<string, PreviewTicket>();
+const pendingPreviewTickets = new Map<string, PendingPreviewTicket>();
+const previewCacheResetListeners = new Set<() => void>();
+let previewTicketGeneration = 0;
 const visibilityListeners = new Map<Element, (visible: boolean) => void>();
 let viewportObserver: IntersectionObserver | undefined;
+
+function cachedPreviewTicket(key: string) {
+  const ticket = previewTickets.get(key);
+  if (!ticket) return;
+  if (ticket.expiresAt <= Date.now()) {
+    previewTickets.delete(key);
+    return;
+  }
+  previewTickets.delete(key);
+  previewTickets.set(key, ticket);
+  return ticket;
+}
+
+function rememberPreviewTicket(key: string, url: string) {
+  const ticket = {
+    url,
+    expiresAt: Date.now() + PREVIEW_TICKET_TTL_MS,
+  };
+  previewTickets.delete(key);
+  previewTickets.set(key, ticket);
+  while (previewTickets.size > MAX_CACHED_PREVIEW_TICKETS) {
+    const oldest = previewTickets.keys().next().value;
+    if (oldest === undefined) break;
+    previewTickets.delete(oldest);
+  }
+  return ticket;
+}
+
+function forgetPreviewTicket(key: string, url: string) {
+  if (previewTickets.get(key)?.url === url) previewTickets.delete(key);
+}
+
+function loadPreviewTicket(
+  key: string,
+  request: (signal: AbortSignal) => Promise<string>,
+) {
+  const cached = cachedPreviewTicket(key);
+  if (cached) return Promise.resolve(cached);
+  const pending = pendingPreviewTickets.get(key);
+  if (pending?.generation === previewTicketGeneration) return pending.promise;
+  while (pendingPreviewTickets.size >= MAX_PENDING_PREVIEW_TICKETS) {
+    const oldestKey = pendingPreviewTickets.keys().next().value;
+    if (oldestKey === undefined) break;
+    pendingPreviewTickets.get(oldestKey)?.controller.abort();
+    pendingPreviewTickets.delete(oldestKey);
+  }
+  const generation = previewTicketGeneration;
+  const controller = new AbortController();
+  const timeout = window.setTimeout(
+    () => controller.abort(),
+    PREVIEW_TICKET_REQUEST_TIMEOUT_MS,
+  );
+  let nextPending: PendingPreviewTicket;
+  const promise = Promise.resolve()
+    .then(() => request(controller.signal))
+    .then((url) => {
+      if (
+        generation !== previewTicketGeneration ||
+        controller.signal.aborted
+      )
+        throw new DOMException("Preview ticket request was cancelled", "AbortError");
+      return rememberPreviewTicket(key, url);
+    })
+    .finally(() => {
+      window.clearTimeout(timeout);
+      if (pendingPreviewTickets.get(key) === nextPending)
+        pendingPreviewTickets.delete(key);
+    });
+  nextPending = { generation, controller, promise };
+  pendingPreviewTickets.set(key, nextPending);
+  return promise;
+}
+
+export function clearLazyFileThumbnailCache() {
+  previewTicketGeneration += 1;
+  for (const pending of pendingPreviewTickets.values())
+    pending.controller.abort();
+  previewTickets.clear();
+  pendingPreviewTickets.clear();
+  clearPausableImageCache();
+  for (const listener of previewCacheResetListeners) listener();
+}
 
 function observeNearViewport(element: Element, listener: (visible: boolean) => void) {
   if (!("IntersectionObserver" in window)) {
@@ -51,21 +152,43 @@ export function LazyFileThumbnail({
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [nearViewport, setNearViewport] = useState(false);
-  const [ticket, setTicket] = useState<{ key: string; url: string }>();
   const resourceKey = `${source}:${shareToken ?? ""}:${fileId}:${version}`;
+  const [ticket, setTicket] = useState<ActivePreviewTicket>();
+  const [ticketRequestAttempt, setTicketRequestAttempt] = useState(0);
   const [failedResourceKey, setFailedResourceKey] = useState<string>();
+  const ticketRefreshRef = useRef({ key: resourceKey, count: 0 });
+  const ticketRequestFailureRef = useRef({ key: resourceKey, count: 0 });
+  if (ticketRefreshRef.current.key !== resourceKey)
+    ticketRefreshRef.current = { key: resourceKey, count: 0 };
+  if (ticketRequestFailureRef.current.key !== resourceKey)
+    ticketRequestFailureRef.current = { key: resourceKey, count: 0 };
   const previewFailed = failedResourceKey === resourceKey;
-  const previewUrl = ticket?.key === resourceKey ? ticket.url : "";
+  const previewUrl =
+    ticket?.key === resourceKey && ticket.expiresAt > Date.now()
+      ? ticket.url
+      : "";
   const previewable = kind === "image" || kind === "video";
   const nativeOnlyImage = kind === "image" && (
     mimeType?.split(";", 1)[0]?.trim().toLowerCase() === "image/svg+xml" ||
     /\.svgz?$/i.test(fileName)
   );
+  const handlePreviewRequestError = (failedUrl: string, status?: number) => {
+    if (!failedUrl || failedUrl !== previewUrl) return;
+    const canRefreshTicket = status === 401 || status === 403 || status === 404;
+    if (canRefreshTicket && ticketRefreshRef.current.count < 1) {
+      ticketRefreshRef.current.count += 1;
+      forgetPreviewTicket(resourceKey, failedUrl);
+      setTicket(undefined);
+      return;
+    }
+    setFailedResourceKey(resourceKey);
+  };
   const imageUrl = usePausableImage({
     active: nearViewport,
-    enabled: kind === "image" && !nativeOnlyImage,
+    enabled: kind === "image" && !nativeOnlyImage && !previewFailed,
     resourceKey,
     url: previewUrl || undefined,
+    onRequestError: handlePreviewRequestError,
   });
 
   useEffect(() => {
@@ -75,22 +198,92 @@ export function LazyFileThumbnail({
   }, [previewable]);
 
   useEffect(() => {
-    if (!nearViewport || !previewable || previewUrl) return;
-    const controller = new AbortController();
-    const request = source === "public"
+    if (!nearViewport) {
+      setTicket((current) =>
+        current?.key === resourceKey ? undefined : current,
+      );
+      return;
+    }
+    const cached = cachedPreviewTicket(resourceKey);
+    setTicket(cached ? { key: resourceKey, ...cached } : undefined);
+  }, [nearViewport, resourceKey]);
+
+  useEffect(() => {
+    const reset = () => {
+      setTicket(undefined);
+      setFailedResourceKey(undefined);
+      ticketRefreshRef.current = { key: resourceKey, count: 0 };
+      ticketRequestFailureRef.current = { key: resourceKey, count: 0 };
+      setTicketRequestAttempt((value) => value + 1);
+    };
+    previewCacheResetListeners.add(reset);
+    return () => {
+      previewCacheResetListeners.delete(reset);
+    };
+  }, [resourceKey]);
+
+  useEffect(() => {
+    if (!ticket || ticket.key !== resourceKey) return;
+    const remaining = ticket.expiresAt - Date.now();
+    if (remaining <= 0) {
+      forgetPreviewTicket(resourceKey, ticket.url);
+      setTicket(undefined);
+      return;
+    }
+    const timeout = window.setTimeout(() => {
+      forgetPreviewTicket(resourceKey, ticket.url);
+      setTicket((current) =>
+        current?.key === resourceKey && current.url === ticket.url
+          ? undefined
+          : current,
+      );
+    }, remaining);
+    return () => window.clearTimeout(timeout);
+  }, [resourceKey, ticket]);
+
+  useEffect(() => {
+    const cachedImageReady =
+      kind === "image" &&
+      !nativeOnlyImage &&
+      (Boolean(imageUrl) || hasCachedPausableImage(resourceKey));
+    if (!nearViewport || !previewable || previewUrl || cachedImageReady) return;
+    let disposed = false;
+    let retryTimer: number | undefined;
+    const request = (signal: AbortSignal) => source === "public"
       ? shareToken
         ? Promise.resolve(`${api.publicSharePreviewUrl(shareToken, fileId)}?v=${encodeURIComponent(version)}`)
         : Promise.reject(new Error("A public share token is required"))
       : source === "trash"
-        ? api.trashFilePreviewTicket(fileId, controller.signal)
-        : api.filePreviewTicket(fileId, controller.signal);
-    void request
-      .then((url) => {
-        if (!controller.signal.aborted) setTicket({ key: resourceKey, url });
+        ? api.trashFilePreviewTicket(fileId, signal)
+        : api.filePreviewTicket(fileId, signal);
+    void loadPreviewTicket(resourceKey, request)
+      .then((nextTicket) => {
+        if (disposed) return;
+        ticketRequestFailureRef.current = { key: resourceKey, count: 0 };
+        setFailedResourceKey((current) =>
+          current === resourceKey ? undefined : current,
+        );
+        setTicket({ key: resourceKey, ...nextTicket });
       })
-      .catch(() => undefined);
-    return () => controller.abort();
-  }, [fileId, nearViewport, previewUrl, previewable, resourceKey, shareToken, source, version]);
+      .catch(() => {
+        if (disposed) return;
+        const failures = ticketRequestFailureRef.current;
+        if (failures.key !== resourceKey) return;
+        if (failures.count >= 2) {
+          setFailedResourceKey(resourceKey);
+          return;
+        }
+        failures.count += 1;
+        retryTimer = window.setTimeout(
+          () => setTicketRequestAttempt((value) => value + 1),
+          500 * 2 ** (failures.count - 1),
+        );
+      });
+    return () => {
+      disposed = true;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+    };
+  }, [fileId, imageUrl, kind, nativeOnlyImage, nearViewport, previewUrl, previewable, resourceKey, shareToken, source, ticketRequestAttempt, version]);
 
   const nativeImageUrl = nativeOnlyImage ? previewUrl : undefined;
   const videoUrl = nearViewport && kind === "video" ? previewUrl : undefined;
@@ -101,7 +294,20 @@ export function LazyFileThumbnail({
           src={imageUrl || nativeImageUrl}
           alt=""
           draggable={false}
-          onError={() => setFailedResourceKey(resourceKey)}
+          onLoad={() => {
+            ticketRefreshRef.current.count = 0;
+            setFailedResourceKey((current) =>
+              current === resourceKey ? undefined : current,
+            );
+          }}
+          onError={() =>
+            nativeImageUrl || imageUrl === previewUrl
+              ? handlePreviewRequestError(
+                  nativeImageUrl || previewUrl,
+                  404,
+                )
+              : setFailedResourceKey(resourceKey)
+          }
         />
       ) : !previewFailed && videoUrl ? (
         <video
@@ -109,7 +315,13 @@ export function LazyFileThumbnail({
           muted
           playsInline
           preload="metadata"
-          onError={() => setFailedResourceKey(resourceKey)}
+          onLoadedMetadata={() => {
+            ticketRefreshRef.current.count = 0;
+            setFailedResourceKey((current) =>
+              current === resourceKey ? undefined : current,
+            );
+          }}
+          onError={() => handlePreviewRequestError(videoUrl, 404)}
         />
       ) : (
         <Fallback size={36} />

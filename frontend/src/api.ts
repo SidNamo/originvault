@@ -277,7 +277,9 @@ export interface PublicShare {
 }
 
 let token = localStorage.getItem("originvault.token") ?? "";
-const sessionListeners = new Set<(value: string) => void>();
+const sessionListeners = new Set<
+  (value: string, external: boolean) => void
+>();
 export const session = {
   get token() {
     return token;
@@ -288,9 +290,9 @@ export const session = {
     value
       ? localStorage.setItem("originvault.token", value)
       : localStorage.removeItem("originvault.token");
-    for (const listener of sessionListeners) listener(value);
+    for (const listener of sessionListeners) listener(value, false);
   },
-  subscribe(listener: (value: string) => void) {
+  subscribe(listener: (value: string, external: boolean) => void) {
     sessionListeners.add(listener);
     return () => {
       sessionListeners.delete(listener);
@@ -298,22 +300,31 @@ export const session = {
   },
 };
 
-const handleResponseStatus = (status: number) => {
-  if (status === 401 && token) session.set("");
+window.addEventListener("storage", (event) => {
+  if (event.key !== "originvault.token") return;
+  const value = event.newValue ?? "";
+  if (token === value) return;
+  token = value;
+  for (const listener of sessionListeners) listener(value, true);
+});
+
+const handleResponseStatus = (status: number, requestToken: string) => {
+  if (status === 401 && requestToken && token === requestToken) session.set("");
 };
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const requestToken = token;
   const response = await fetch(`${API_URL}${path}`, {
     ...init,
     headers: {
       ...(init.body instanceof FormData
         ? {}
         : { "Content-Type": "application/json" }),
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(requestToken ? { Authorization: `Bearer ${requestToken}` } : {}),
       ...init.headers,
     },
   });
-  handleResponseStatus(response.status);
+  handleResponseStatus(response.status, requestToken);
   if (!response.ok) {
     const body = await response
       .json()
@@ -716,15 +727,16 @@ export const api = {
     window.setTimeout(() => URL.revokeObjectURL(url), 30_000);
   },
   downloadArchive: async (selections: BulkSelection[]) => {
+    const requestToken = token;
     const response = await fetch(`${API_URL}/bulk/download`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${requestToken}`,
       },
       body: JSON.stringify({ selections }),
     });
-    handleResponseStatus(response.status);
+    handleResponseStatus(response.status, requestToken);
     if (!response.ok) {
       const result = await response.json().catch(() => ({}));
       throw new Error(result.error ?? "Archive download failed");
@@ -771,11 +783,12 @@ export const api = {
     return apiResourceUrl(result.url);
   },
   fileText: async (id: string, encoding = "auto"): Promise<TextFileContent> => {
+    const requestToken = token;
     const response = await fetch(
       `${API_URL}/files/${encodeURIComponent(id)}/text?encoding=${encodeURIComponent(encoding)}`,
-      { headers: token ? { Authorization: `Bearer ${token}` } : {} },
+      { headers: requestToken ? { Authorization: `Bearer ${requestToken}` } : {} },
     );
-    handleResponseStatus(response.status);
+    handleResponseStatus(response.status, requestToken);
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
       throw new Error(body.error ?? "Text file could not be opened");
@@ -788,11 +801,12 @@ export const api = {
     };
   },
   trashFileText: async (id: string, encoding = "auto"): Promise<TextFileContent> => {
+    const requestToken = token;
     const response = await fetch(
       `${API_URL}/trash/files/${encodeURIComponent(id)}/text?encoding=${encodeURIComponent(encoding)}`,
-      { headers: token ? { Authorization: `Bearer ${token}` } : {} },
+      { headers: requestToken ? { Authorization: `Bearer ${requestToken}` } : {} },
     );
-    handleResponseStatus(response.status);
+    handleResponseStatus(response.status, requestToken);
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
       throw new Error(body.error ?? "Text file could not be opened");
@@ -811,6 +825,7 @@ export const api = {
     hasBom: boolean,
     etag: string,
   ) => {
+    const requestToken = token;
     const query = new URLSearchParams({
       encoding,
       bom: String(hasBom),
@@ -821,13 +836,13 @@ export const api = {
         method: "PUT",
         headers: {
           "Content-Type": "text/plain; charset=utf-8",
-          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          ...(requestToken ? { Authorization: `Bearer ${requestToken}` } : {}),
           "If-Match": etag,
         },
         body: text,
       },
     );
-    handleResponseStatus(response.status);
+    handleResponseStatus(response.status, requestToken);
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
       throw new Error(body.error ?? "Text file could not be saved");
@@ -864,13 +879,15 @@ export const api = {
     const query = new URLSearchParams();
     if (folderId) query.set("folderId", folderId);
     if (relativeDirectory) query.set("relativeDirectory", relativeDirectory);
+    const requestToken = token;
     const xhr = new XMLHttpRequest();
     const promise = new Promise<UploadResult>((resolve, reject) => {
       xhr.open(
         "POST",
         `${API_URL}/files/upload${query.size ? `?${query}` : ""}`,
       );
-      if (token) xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+      if (requestToken)
+        xhr.setRequestHeader("Authorization", `Bearer ${requestToken}`);
       xhr.upload.addEventListener("progress", (event) => {
         if (event.lengthComputable)
           onProgress(
@@ -878,7 +895,7 @@ export const api = {
           );
       });
       xhr.addEventListener("load", () => {
-        handleResponseStatus(xhr.status);
+        handleResponseStatus(xhr.status, requestToken);
         let result: Record<string, unknown> = {};
         try {
           result = JSON.parse(xhr.responseText || "{}");
@@ -921,6 +938,7 @@ export const api = {
     offset: number,
     onProgress: (loadedBytes: number) => void,
   ) => {
+    const requestToken = token;
     const xhr = new XMLHttpRequest();
     const promise = new Promise<{
       offset: number;
@@ -931,14 +949,14 @@ export const api = {
         "PATCH",
         `${API_URL}/upload-sessions/${encodeURIComponent(sessionId)}`,
       );
-      xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+      xhr.setRequestHeader("Authorization", `Bearer ${requestToken}`);
       xhr.setRequestHeader("Content-Type", "application/offset+octet-stream");
       xhr.setRequestHeader("Upload-Offset", String(offset));
       xhr.upload.addEventListener("progress", (event) =>
         onProgress(event.loaded),
       );
       xhr.addEventListener("load", () => {
-        handleResponseStatus(xhr.status);
+        handleResponseStatus(xhr.status, requestToken);
         let result: Record<string, unknown> = {};
         try {
           result = JSON.parse(xhr.responseText || "{}");

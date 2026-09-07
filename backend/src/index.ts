@@ -633,6 +633,10 @@ async function start(): Promise<void> {
   const trashCleanupTimer = setInterval(() => { void purgeExpiredTrash(); }, 6 * 60 * 60 * 1_000);
   trashCleanupTimer.unref();
   const server = app.listen(config.port, () => logger.info({ event: 'service_ready', port: config.port }, 'OriginVault backend is ready'));
+  // Node's default five-minute limit cuts off valid multi-gigabyte WebDAV uploads.
+  const largeRequestTimeoutMs = 30 * 60 * 1_000;
+  server.requestTimeout = largeRequestTimeoutMs;
+  server.setTimeout(largeRequestTimeoutMs);
   const shutdown = (signal: string) => {
     logger.warn({ event: 'service_shutdown_started', signal }, 'OriginVault backend shutdown started');
     server.close(async (error) => {

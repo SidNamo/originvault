@@ -427,7 +427,24 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
         hash.update(chunk); callback(null, chunk);
       },
     });
-    await pipeline(req, meter, createWriteStream(stagedPath, { flags: 'wx', mode: 0o600 }));
+    logForRequest(req).info({
+      event: 'webdav_put_started',
+      relativePath: targetRelativePath,
+      declaredSizeBytes: declaredLength,
+    }, 'WebDAV upload stream started');
+    try {
+      await pipeline(req, meter, createWriteStream(stagedPath, { flags: 'wx', mode: 0o600 }));
+    } catch (error) {
+      logForRequest(req).warn({
+        event: 'webdav_put_stream_failed',
+        relativePath: targetRelativePath,
+        declaredSizeBytes: declaredLength,
+        receivedSizeBytes: size.toString(),
+        code: (error as NodeJS.ErrnoException)?.code,
+        err: error,
+      }, 'WebDAV upload stream ended before completion');
+      throw error;
+    }
     sha256 = hash.digest('hex');
     let requestedLastModified = clientModifiedTime?.value ?? new Date();
     try {
