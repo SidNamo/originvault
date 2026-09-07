@@ -1776,6 +1776,16 @@ svg {
   grid-template-columns: repeat(auto-fill, minmax(205px, 1fr));
 }
 
+.virtual-file-spacer {
+  min-width: 0;
+  grid-column: 1 / -1;
+  pointer-events: none;
+}
+
+.virtual-file-grid.listing-inactive {
+  pointer-events: none;
+}
+
 .file-card {
   min-width: 0;
   min-height: 55px;
@@ -1814,6 +1824,62 @@ svg {
   gap: 8px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
+}
+
+.file-card-skeleton {
+  pointer-events: none;
+}
+
+.skeleton-icon,
+.skeleton-copy > span {
+  display: block;
+  background: #e7e7e2;
+  animation: skeleton-pulse 1.25s ease-in-out infinite alternate;
+}
+
+.skeleton-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 4px;
+}
+
+.skeleton-copy {
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.skeleton-copy > span {
+  width: min(72%, 260px);
+  height: 9px;
+  border-radius: 3px;
+}
+
+.skeleton-copy > span:last-child {
+  width: min(42%, 150px);
+  height: 7px;
+  opacity: 0.72;
+}
+
+.view-preview .file-card-skeleton .skeleton-icon {
+  width: 100%;
+  height: 155px;
+  grid-column: 1 / -1;
+  grid-row: 1;
+}
+
+.view-preview .file-card-skeleton .skeleton-copy {
+  grid-column: 1;
+  grid-row: 2;
+}
+
+@keyframes skeleton-pulse {
+  from {
+    opacity: 0.52;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 .file-card:hover {
@@ -1952,6 +2018,16 @@ svg {
   border-radius: 0;
 }
 
+.parent-folder-grid.view-details {
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+
+.parent-folder-grid.view-details + .virtual-file-grid.view-details {
+  margin-top: 0;
+  border-top: 0;
+  border-radius: 0 0 var(--radius) var(--radius);
+}
+
 .parent-folder-card:hover {
   background: var(--surface-soft);
 }
@@ -2058,14 +2134,6 @@ svg {
 .empty p {
   margin: 0;
   font-size: 11px;
-}
-
-.empty-in-grid {
-  min-height: 190px;
-  margin: 0;
-  grid-column: 1 / -1;
-  border-color: transparent;
-  border-radius: 0;
 }
 
 .selection-box {

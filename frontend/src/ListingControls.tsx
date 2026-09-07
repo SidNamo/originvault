@@ -23,7 +23,9 @@ export function ListingControls({
 }) {
   return (
     <div className="file-list-tools">
-      <span>{itemCount}개 항목</span>
+      <span>
+        {itemCount.toLocaleString("ko-KR")}개 항목
+      </span>
       <div className="sort-controls">
         <label>
           <select aria-label="정렬 기준" value={sortField} onChange={(event) => onSortFieldChange(event.target.value as ListingSortField)}>

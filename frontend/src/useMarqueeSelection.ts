@@ -28,6 +28,7 @@ type DragSelection = {
   dragging: boolean;
   items: SelectableBounds[];
   frame?: number;
+  limitNotified?: boolean;
 };
 
 function sameSelection(left: Set<string>, right: Set<string>): boolean {
@@ -48,6 +49,8 @@ export function useMarqueeSelection<
   selectedKeys,
   setSelectedKeys,
   onClear,
+  maxSelected,
+  onSelectionLimit,
 }: {
   surfaceRef: RefObject<TSurface | null>;
   itemsRef: RefObject<TItems | null>;
@@ -57,21 +60,46 @@ export function useMarqueeSelection<
   selectedKeys: Set<string>;
   setSelectedKeys: Dispatch<SetStateAction<Set<string>>>;
   onClear: () => void;
+  maxSelected?: number;
+  onSelectionLimit?: () => void;
 }) {
   const boxRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragSelection | undefined>(undefined);
   const selectedKeysRef = useRef(selectedKeys);
   const enabledRef = useRef(enabled);
   const clearRef = useRef(onClear);
+  const maxSelectedRef = useRef(maxSelected);
+  const selectionLimitRef = useRef(onSelectionLimit);
   const suppressClickRef = useRef(false);
   const [active, setActive] = useState(false);
   selectedKeysRef.current = selectedKeys;
   enabledRef.current = enabled;
   clearRef.current = onClear;
+  maxSelectedRef.current = maxSelected;
+  selectionLimitRef.current = onSelectionLimit;
 
   useEffect(() => {
     const surface = surfaceRef.current;
     if (!surface) return;
+
+    const collectSelectableItems = () => {
+      const items = itemsRef.current;
+      if (!items) return [];
+      return Array.from(
+        items.querySelectorAll<HTMLElement>(itemSelector),
+      ).flatMap((item) => {
+        const key = item.getAttribute(itemDataAttribute);
+        if (!key) return [];
+        const bounds = item.getBoundingClientRect();
+        return [{
+          key,
+          left: bounds.left,
+          right: bounds.right,
+          top: bounds.top,
+          bottom: bounds.bottom,
+        }];
+      });
+    };
 
     const update = (drag: DragSelection) => {
       drag.frame = undefined;
@@ -86,7 +114,8 @@ export function useMarqueeSelection<
         box.style.width = `${right - left}px`;
         box.style.height = `${bottom - top}px`;
       }
-      const hits = new Set(drag.base);
+      drag.items = collectSelectableItems();
+      let hits = new Set(drag.base);
       for (const item of drag.items)
         if (
           item.left < right &&
@@ -95,6 +124,14 @@ export function useMarqueeSelection<
           item.bottom > top
         )
           hits.add(item.key);
+      const limit = maxSelectedRef.current;
+      if (limit !== undefined && hits.size > limit) {
+        hits = new Set([...hits].slice(0, limit));
+        if (!drag.limitNotified) {
+          drag.limitNotified = true;
+          selectionLimitRef.current?.();
+        }
+      }
       setSelectedKeys((previous) =>
         sameSelection(previous, hits) ? previous : hits,
       );
@@ -142,20 +179,7 @@ export function useMarqueeSelection<
         return;
       if (!drag.dragging) {
         drag.dragging = true;
-        drag.items = Array.from(
-          items.querySelectorAll<HTMLElement>(itemSelector),
-        ).flatMap((item) => {
-          const key = item.getAttribute(itemDataAttribute);
-          if (!key) return [];
-          const bounds = item.getBoundingClientRect();
-          return [{
-            key,
-            left: bounds.left,
-            right: bounds.right,
-            top: bounds.top,
-            bottom: bounds.bottom,
-          }];
-        });
+        drag.items = collectSelectableItems();
         setActive(true);
         items.classList.add("marquee-selecting");
         try {
@@ -204,10 +228,22 @@ export function useMarqueeSelection<
 
     const pointerUp = (event: PointerEvent) => finish(event);
     const pointerCancel = (event: PointerEvent) => finish(event, true);
+    const viewportChanged = () => {
+      const drag = dragRef.current;
+      if (drag?.dragging) scheduleUpdate(drag);
+    };
+    const preventScrollDuringSelection = (event: WheelEvent) => {
+      if (dragRef.current?.dragging) event.preventDefault();
+    };
     surface.addEventListener("pointerdown", pointerDown);
     window.addEventListener("pointermove", pointerMove, { passive: false });
     window.addEventListener("pointerup", pointerUp);
     window.addEventListener("pointercancel", pointerCancel);
+    window.addEventListener("scroll", viewportChanged, { passive: true });
+    window.addEventListener("resize", viewportChanged);
+    window.addEventListener("wheel", preventScrollDuringSelection, {
+      passive: false,
+    });
     return () => {
       const drag = dragRef.current;
       if (drag?.frame !== undefined) window.cancelAnimationFrame(drag.frame);
@@ -216,6 +252,9 @@ export function useMarqueeSelection<
       window.removeEventListener("pointermove", pointerMove);
       window.removeEventListener("pointerup", pointerUp);
       window.removeEventListener("pointercancel", pointerCancel);
+      window.removeEventListener("scroll", viewportChanged);
+      window.removeEventListener("resize", viewportChanged);
+      window.removeEventListener("wheel", preventScrollDuringSelection);
     };
   }, [itemDataAttribute, itemSelector, itemsRef, setSelectedKeys, surfaceRef]);
 

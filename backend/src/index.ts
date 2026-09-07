@@ -27,7 +27,29 @@ import { migrateLegacyTrashStorage, purgeExpiredTrash, TrashError, trashRouter, 
 const app = express();
 const registrationRateLimit = createRateLimiter({ windowMs: 60 * 60 * 1_000, max: 5 });
 const loginRateLimit = createRateLimiter({ windowMs: 15 * 60 * 1_000, max: 10 });
-const webdavRateLimit = createRateLimiter({ windowMs: 60 * 1_000, max: 600 });
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function directItemScope(userId: string, folderId: string | null, showHiddenFiles: boolean) {
+  const values: Array<string | boolean> = [userId];
+  let folderScope: string;
+  let fileScope: string;
+  if (folderId) {
+    values.push(folderId);
+    const folderParameter = `$${values.length}`;
+    folderScope = `parent_id=${folderParameter}`;
+    fileScope = `folder_id=${folderParameter}`;
+  } else {
+    folderScope = 'parent_id IS NULL';
+    fileScope = 'folder_id IS NULL';
+  }
+  values.push(showHiddenFiles);
+  return {
+    values,
+    folderScope,
+    fileScope,
+    hiddenParameter: `$${values.length}`,
+  };
+}
 
 function isAllowedBrowserOrigin(origin: string | undefined): boolean {
   return !origin || config.corsAllowedOrigins.includes(origin);
@@ -43,7 +65,7 @@ app.use((req, res, next) => {
   next();
 });
 app.use(requestLogging);
-app.use('/webdav', webdavRateLimit, webdavRouter);
+app.use('/webdav', webdavRouter);
 app.use(cors({
   origin: (origin, callback) => callback(null, isAllowedBrowserOrigin(origin)),
   credentials: true,
@@ -177,14 +199,60 @@ app.post('/api/auth/login', loginRateLimit, async (req, res) => {
   return res.json({ token: signToken(sessionUser), user: publicUser(sessionUser) });
 });
 
-app.get('/api/items', requireAuth, async (req, res) => {
+app.get('/api/items/count', requireAuth, async (req, res) => {
+  if (req.query.folderId !== undefined && typeof req.query.folderId !== 'string')
+    return res.status(400).json({ error: 'folderId is invalid' });
   const folderId = typeof req.query.folderId === 'string' ? req.query.folderId : null;
-  const [folders, files] = await Promise.all([
-    db.query('SELECT id, name, parent_id AS "parentId", relative_path AS "relativePath", created_at AS "createdAt", original_created_at AS "originalCreatedAt", original_modified_at AS "originalModifiedAt" FROM folders WHERE user_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND trashed_at IS NULL AND ($3::boolean OR NOT is_hidden) ORDER BY name', [req.user!.id, folderId, req.user!.showHiddenFiles]),
-    db.query('SELECT id, stored_name AS name, mime_type AS "mimeType", size_bytes::text AS "sizeBytes", sha256, original_created_at AS "originalCreatedAt", client_last_modified AS "originalModifiedAt", created_at AS "createdAt" FROM files WHERE user_id=$1 AND folder_id IS NOT DISTINCT FROM $2 AND trashed_at IS NULL AND ($3::boolean OR NOT is_hidden) ORDER BY created_at DESC', [req.user!.id, folderId, req.user!.showHiddenFiles]),
-  ]);
-  logForRequest(req).debug({ event: 'items_listed', folderId, folderCount: folders.rowCount, fileCount: files.rowCount }, 'Folder contents listed');
-  res.json({ folders: folders.rows, files: files.rows });
+  if (folderId !== null && !UUID_PATTERN.test(folderId))
+    return res.status(400).json({ error: 'folderId is invalid' });
+  const startedAt = process.hrtime.bigint();
+  const scope = directItemScope(req.user!.id, folderId, req.user!.showHiddenFiles);
+  const result = await db.query<{ folderCount: string; fileCount: string }>(`
+    SELECT
+      (SELECT COUNT(*)::text FROM folders WHERE user_id=$1 AND ${scope.folderScope}
+        AND trashed_at IS NULL AND (${scope.hiddenParameter}::boolean OR NOT is_hidden)) AS "folderCount",
+      (SELECT COUNT(*)::text FROM files WHERE user_id=$1 AND ${scope.fileScope}
+        AND trashed_at IS NULL AND (${scope.hiddenParameter}::boolean OR NOT is_hidden)) AS "fileCount"
+  `, scope.values);
+  const folderCount = Number(result.rows[0]?.folderCount);
+  const fileCount = Number(result.rows[0]?.fileCount);
+  if (!Number.isSafeInteger(folderCount) || !Number.isSafeInteger(fileCount))
+    throw new Error('Direct item count exceeds the supported range');
+  logForRequest(req).debug({
+    event: 'item_counts_read',
+    folderId,
+    folderCount,
+    fileCount,
+    durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000,
+  }, 'Direct folder and file counts read');
+  return res.json({ folderCount, fileCount });
+});
+
+app.get('/api/items', requireAuth, async (req, res) => {
+  if (req.query.folderId !== undefined && typeof req.query.folderId !== 'string')
+    return res.status(400).json({ error: 'folderId is invalid' });
+  const folderId = typeof req.query.folderId === 'string' ? req.query.folderId : null;
+  if (folderId !== null && !UUID_PATTERN.test(folderId))
+    return res.status(400).json({ error: 'folderId is invalid' });
+  const startedAt = process.hrtime.bigint();
+  const scope = directItemScope(req.user!.id, folderId, req.user!.showHiddenFiles);
+  const folders = await db.query(`SELECT id,name,parent_id AS "parentId",relative_path AS "relativePath",created_at AS "createdAt",
+      original_created_at AS "originalCreatedAt",original_modified_at AS "originalModifiedAt"
+      FROM folders WHERE user_id=$1 AND ${scope.folderScope} AND trashed_at IS NULL
+        AND (${scope.hiddenParameter}::boolean OR NOT is_hidden) ORDER BY name,id`, scope.values);
+  const files = await db.query(`SELECT id,stored_name AS name,mime_type AS "mimeType",size_bytes::text AS "sizeBytes",
+      original_created_at AS "originalCreatedAt",client_last_modified AS "originalModifiedAt",
+      modified_at AS version
+      FROM files WHERE user_id=$1 AND ${scope.fileScope} AND trashed_at IS NULL
+        AND (${scope.hiddenParameter}::boolean OR NOT is_hidden) ORDER BY stored_name,id`, scope.values);
+  logForRequest(req).debug({
+    event: 'items_listed',
+    folderId,
+    folderCount: folders.rowCount,
+    fileCount: files.rowCount,
+    durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000,
+  }, 'Lightweight direct folder contents listed');
+  return res.json({ folders: folders.rows, files: files.rows });
 });
 
 app.get('/api/folders/tree', requireAuth, async (req, res) => {

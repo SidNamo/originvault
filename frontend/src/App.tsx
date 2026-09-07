@@ -2,6 +2,7 @@ import {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -43,12 +44,12 @@ import {
   type BulkSelection,
   type CollisionChoice,
   type FileDetail,
+  type FileListItem,
   type Folder as VaultFolder,
   type FolderDetail,
   type ServerStorage,
   type StorageUsage,
   type UserProfile,
-  type VaultFile,
   session,
 } from "./api";
 import { FolderTree } from "./FolderTree";
@@ -67,9 +68,11 @@ import { ListingControls, type ListingSortDirection, type ListingSortField, type
 import { LazyFileThumbnail } from "./LazyFileThumbnail";
 import { beginClipboardCopy, copyText } from "./clipboard";
 import { useMarqueeSelection } from "./useMarqueeSelection";
+import { VirtualizedFileGrid } from "./VirtualizedFileGrid";
 const UPLOAD_CHUNK_BYTES = 5 * 1024 * 1024;
 const HASH_CHUNK_BYTES = 8 * 1024 * 1024;
 const HASH_CONCURRENCY = 2;
+const BULK_SELECTION_LIMIT = 1_000;
 let activeHashJobs = 0;
 const hashWaiters: Array<() => void> = [];
 const runHashLimited = async <T,>(work: () => Promise<T>): Promise<T> => {
@@ -118,12 +121,27 @@ const hashFile = async (
 };
 const uploadQueueKey = (username: string) =>
   `originvault.uploadQueue.${username}`;
+const MAX_PERSISTED_COMPLETED_UPLOADS = 100;
+const retainedUploadTasks = (tasks: UploadTask[]) => {
+  const retained: UploadTask[] = [];
+  let completed = 0;
+  for (let index = tasks.length - 1; index >= 0; index -= 1) {
+    const task = tasks[index]!;
+    if (
+      task.status === "completed" &&
+      completed++ >= MAX_PERSISTED_COMPLETED_UPLOADS
+    )
+      continue;
+    retained.push(task);
+  }
+  return retained.reverse();
+};
 const restoreUploadQueue = (username: string): UploadTask[] => {
   try {
     const parsed = JSON.parse(
       localStorage.getItem(uploadQueueKey(username)) ?? "[]",
     ) as UploadTask[];
-    return parsed.map((task) => ({
+    return retainedUploadTasks(parsed).map((task) => ({
       ...task,
       file: undefined,
       status: task.status === "completed" ? "completed" : "paused",
@@ -162,7 +180,7 @@ type ItemMenuTarget =
     }
   | {
       type: "file";
-      item: VaultFile;
+      item: FileListItem;
     };
 type ItemContextMenu = (
   | ItemMenuTarget
@@ -511,14 +529,19 @@ function Dashboard({
   );
   const [items, setItems] = useState<{
     folders: VaultFolder[];
-    files: VaultFile[];
+    files: FileListItem[];
   }>({ folders: [], files: [] });
+  const [itemsLoading, setItemsLoading] = useState(true);
+  const [itemCounts, setItemCounts] = useState({ folderCount: 0, fileCount: 0 });
+  const [listingError, setListingError] = useState("");
   const [allFolders, setAllFolders] = useState<VaultFolder[]>([]);
   const [trail, setTrail] = useState<VaultFolder[]>([]);
   const [navigationReady, setNavigationReady] = useState(
     !initialNavigation.legacyFolderId && !initialNavigation.folderPath.length,
   );
-  const [previewFile, setPreviewFile] = useState<VaultFile>();
+  const [previewFile, setPreviewFile] = useState<
+    Pick<FileListItem, "id" | "name">
+  >();
   const [notices, setNotices] = useState<Array<{ id: string; message: string }>>([]);
   const setMessage = useCallback((message: string) => {
     if (!message) return;
@@ -553,7 +576,7 @@ function Dashboard({
   const [mobileTreeOpen, setMobileTreeOpen] = useState(false);
   const [contextMenu, setContextMenu] = useState<ItemContextMenu>();
   const [collisionPrompt, setCollisionPrompt] = useState<CollisionPrompt>();
-  const [detailTarget, setDetailTarget] = useState<VaultFile>();
+  const [detailTarget, setDetailTarget] = useState<FileListItem>();
   const [fileDetail, setFileDetail] = useState<FileDetail>();
   const [detailLoading, setDetailLoading] = useState(false);
   const [folderDetailTarget, setFolderDetailTarget] = useState<VaultFolder>();
@@ -588,11 +611,14 @@ function Dashboard({
   const folderPicker = useRef<HTMLInputElement>(null);
   const runningUploads = useRef(new Set<string>());
   const uploadAborters = useRef(new Map<string, () => void>());
+  const uploadTasksRef = useRef(uploadTasks);
+  const uploadQueueDirty = useRef(true);
   const cancelledUploadTasks = useRef(new Set<string>());
   const pausedUploadTasks = useRef(new Set<string>());
   const hashingTasks = useRef(new Set<string>());
   const uploadRefreshPending = useRef(false);
   const listRequestSequence = useRef(0);
+  const listAbortController = useRef<AbortController | undefined>(undefined);
   const treeRequestSequence = useRef(0);
   const contentRef = useRef<HTMLElement>(null);
   const filesSection = useRef<HTMLElement>(null);
@@ -608,6 +634,7 @@ function Dashboard({
   const collisionResolver = useRef<
     ((decisions: Map<string, CollisionChoice>) => void) | undefined
   >(undefined);
+  const activeViewRef = useRef(activeView);
   const trailRef = useRef(trail);
   const allFoldersRef = useRef(allFolders);
   const pendingFolderIdRef = useRef(initialNavigation.legacyFolderId);
@@ -616,6 +643,7 @@ function Dashboard({
       ? initialNavigation.folderPath
       : undefined,
   );
+  activeViewRef.current = activeView;
   trailRef.current = trail;
   allFoldersRef.current = allFolders;
   const folder = trail.at(-1);
@@ -633,16 +661,85 @@ function Dashboard({
     ).webkitdirectory = true;
   };
   const load = useCallback(async () => {
+    const folderId = folder?.id;
+    if (trailRef.current.at(-1)?.id !== folderId) return;
+    listAbortController.current?.abort();
+    const controller = new AbortController();
+    listAbortController.current = controller;
     const sequence = ++listRequestSequence.current;
-    setItems({ folders: [], files: [] });
+    setItemsLoading(true);
+    setListingError("");
+    setContextMenu(undefined);
+    let manifestApplied = false;
+    void api.itemCounts(folderId, controller.signal).then((counts) => {
+      if (
+        !manifestApplied &&
+        sequence === listRequestSequence.current &&
+        trailRef.current.at(-1)?.id === folderId
+      )
+        setItemCounts(counts);
+    }).catch(() => undefined);
     try {
-      const result = await api.items(folder?.id);
-      if (sequence === listRequestSequence.current) setItems(result);
+      const result = await api.items(folderId, controller.signal);
+      if (
+        sequence !== listRequestSequence.current ||
+        trailRef.current.at(-1)?.id !== folderId
+      )
+        return;
+      manifestApplied = true;
+      const validKeys = new Set([
+        ...result.folders.map((item) => `folder:${item.id}`),
+        ...result.files.map((item) => `file:${item.id}`),
+      ]);
+      setSelectedKeys((previous) => {
+        if ([...previous].every((key) => validKeys.has(key))) return previous;
+        return new Set([...previous].filter((key) => validKeys.has(key)));
+      });
+      if (
+        selectionAnchor.current &&
+        !validKeys.has(selectionAnchor.current)
+      )
+        selectionAnchor.current = undefined;
+      setItems({ folders: result.folders, files: result.files });
+      setContextMenu(undefined);
+      setItemCounts({
+        folderCount: result.folders.length,
+        fileCount: result.files.length,
+      });
     } catch (e) {
-      if (sequence === listRequestSequence.current)
-        setMessage(e instanceof Error ? e.message : "목록 오류");
+      if ((e as { name?: unknown })?.name === "AbortError") return;
+      if (
+        sequence === listRequestSequence.current &&
+        trailRef.current.at(-1)?.id === folderId
+      ) {
+        manifestApplied = true;
+        const message = e instanceof Error ? e.message : "목록 오류";
+        setItems({ folders: [], files: [] });
+        setItemCounts({ folderCount: 0, fileCount: 0 });
+        setSelectedKeys(new Set());
+        selectionAnchor.current = undefined;
+        setListingError(message);
+        setMessage(message);
+      }
+    } finally {
+      if (sequence === listRequestSequence.current) {
+        if (listAbortController.current === controller) {
+          controller.abort();
+          listAbortController.current = undefined;
+        }
+        setItemsLoading(false);
+      }
     }
   }, [folder?.id]);
+  const clearItemsForNavigation = useCallback(() => {
+    listAbortController.current?.abort();
+    listAbortController.current = undefined;
+    listRequestSequence.current += 1;
+    setItems({ folders: [], files: [] });
+    setItemsLoading(true);
+    setItemCounts({ folderCount: 0, fileCount: 0 });
+    setListingError("");
+  }, []);
   const loadTree = useCallback(async () => {
     const sequence = ++treeRequestSequence.current;
     setTreeRefreshing(true);
@@ -664,8 +761,11 @@ function Dashboard({
           : requestedPath
             ? dashboardTrailFromPath(folders, requestedPath)
             : dashboardFolderTrail(folders, selectedId!);
-        trailRef.current = next ?? [];
-        setTrail(next ?? []);
+        const nextTrail = next ?? [];
+        if (trailRef.current.at(-1)?.id !== nextTrail.at(-1)?.id)
+          clearItemsForNavigation();
+        trailRef.current = nextTrail;
+        setTrail(nextTrail);
         const location = dashboardNavigation();
         if (location.view === "files") {
           writeDashboardNavigation(
@@ -685,7 +785,7 @@ function Dashboard({
           setNavigationReady(true);
       }
     }
-  }, []);
+  }, [clearItemsForNavigation]);
   const refreshStorage = useCallback(async () => {
     try {
       const profile = await api.me();
@@ -710,6 +810,10 @@ function Dashboard({
   useEffect(() => {
     if (activeView === "files" && navigationReady) void load();
   }, [activeView, load, navigationReady]);
+  useEffect(() => () => {
+    listRequestSequence.current += 1;
+    listAbortController.current?.abort();
+  }, []);
   useEffect(() => {
     setSelectedKeys(new Set());
     selectionAnchor.current = undefined;
@@ -791,11 +895,30 @@ function Dashboard({
     };
   }, [contextMenu]);
   useEffect(() => {
-    localStorage.setItem(
-      uploadQueueKey(username),
-      JSON.stringify(uploadTasks.map(({ file: _file, ...task }) => task)),
-    );
-  }, [uploadTasks, username]);
+    uploadTasksRef.current = uploadTasks;
+    uploadQueueDirty.current = true;
+  }, [uploadTasks]);
+  useEffect(() => {
+    const persistUploadQueue = () => {
+      if (!uploadQueueDirty.current) return;
+      uploadQueueDirty.current = false;
+      try {
+        const persisted = retainedUploadTasks(uploadTasksRef.current).map(
+          ({ file: _file, ...task }) => task,
+        );
+        localStorage.setItem(uploadQueueKey(username), JSON.stringify(persisted));
+      } catch {
+        /* Keep the in-memory queue usable when browser storage is full. */
+      }
+    };
+    const interval = window.setInterval(persistUploadQueue, 2_000);
+    window.addEventListener("pagehide", persistUploadQueue);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("pagehide", persistUploadQueue);
+      persistUploadQueue();
+    };
+  }, [username]);
   useEffect(
     () => () => {
       for (const abort of uploadAborters.current.values()) abort();
@@ -808,6 +931,11 @@ function Dashboard({
   const navigateToTrail = useCallback((nextTrail: VaultFolder[]) => {
     pendingFolderIdRef.current = undefined;
     pendingFolderPathRef.current = undefined;
+    if (
+      activeViewRef.current !== "files" ||
+      trailRef.current.at(-1)?.id !== nextTrail.at(-1)?.id
+    )
+      clearItemsForNavigation();
     trailRef.current = nextTrail;
     setNavigationReady(true);
     setActiveView("files");
@@ -816,22 +944,24 @@ function Dashboard({
       "files",
       nextTrail.map((entry) => entry.name),
     );
-  }, []);
+  }, [clearItemsForNavigation]);
   const navigateToView = useCallback((view: DashboardView) => {
     setActiveView(view);
     if (view !== "files") {
+      clearItemsForNavigation();
       pendingFolderIdRef.current = undefined;
       pendingFolderPathRef.current = undefined;
       setNavigationReady(true);
       writeDashboardNavigation(view, []);
       return;
     }
+    if (activeViewRef.current !== "files") clearItemsForNavigation();
     if (pendingFolderIdRef.current) return;
     writeDashboardNavigation(
       "files",
       pendingFolderPathRef.current ?? trailRef.current.map((entry) => entry.name),
     );
-  }, []);
+  }, [clearItemsForNavigation]);
   useEffect(() => {
     if (initialNavigation.legacyFolderId) return;
     writeDashboardNavigation(
@@ -845,6 +975,7 @@ function Dashboard({
       const next = dashboardNavigation();
       setActiveView(next.view);
       if (next.view !== "files") {
+        clearItemsForNavigation();
         pendingFolderIdRef.current = undefined;
         pendingFolderPathRef.current = undefined;
         setNavigationReady(true);
@@ -854,6 +985,11 @@ function Dashboard({
       if (!next.legacyFolderId && !next.folderPath.length) {
         pendingFolderIdRef.current = undefined;
         pendingFolderPathRef.current = undefined;
+        if (
+          activeViewRef.current !== "files" ||
+          trailRef.current.at(-1)?.id !== undefined
+        )
+          clearItemsForNavigation();
         trailRef.current = [];
         setNavigationReady(true);
         setTrail([]);
@@ -866,6 +1002,11 @@ function Dashboard({
       if (nextTrail) {
         pendingFolderIdRef.current = undefined;
         pendingFolderPathRef.current = undefined;
+        if (
+          activeViewRef.current !== "files" ||
+          trailRef.current.at(-1)?.id !== nextTrail.at(-1)?.id
+        )
+          clearItemsForNavigation();
         trailRef.current = nextTrail;
         setNavigationReady(true);
         setTrail(nextTrail);
@@ -880,12 +1021,13 @@ function Dashboard({
       pendingFolderPathRef.current = next.folderPath.length
         ? next.folderPath
         : undefined;
+      clearItemsForNavigation();
       setNavigationReady(false);
       void loadTree();
     };
     window.addEventListener("popstate", restoreNavigation);
     return () => window.removeEventListener("popstate", restoreNavigation);
-  }, [loadTree]);
+  }, [clearItemsForNavigation, loadTree]);
 
   const selectTreeFolder = useCallback(
     (selected?: VaultFolder) => {
@@ -1565,47 +1707,75 @@ function Dashboard({
     }
     return { files, folders, skipped, executed: effective };
   };
-  const directionFactor = sortDirection === "asc" ? 1 : -1;
-  const compareOriginalTimes = (left?: string | null, right?: string | null) => {
-    const leftTime = left ? new Date(left).getTime() : Number.NaN;
-    const rightTime = right ? new Date(right).getTime() : Number.NaN;
-    const leftKnown = Number.isFinite(leftTime);
-    const rightKnown = Number.isFinite(rightTime);
-    if (!leftKnown || !rightKnown) return leftKnown ? -1 : rightKnown ? 1 : 0;
-    return (leftTime - rightTime) * directionFactor;
-  };
-  const sortedFolders = [...items.folders].sort((left, right) => {
-    let compared = 0;
-    if (sortField === "originalCreated")
-      compared = compareOriginalTimes(left.originalCreatedAt, right.originalCreatedAt);
-    else if (sortField === "originalModified")
-      compared = compareOriginalTimes(left.originalModifiedAt, right.originalModifiedAt);
-    if (!compared) compared = nameCollator.compare(left.name, right.name);
-    return (sortField === "originalCreated" || sortField === "originalModified") && compared
-      ? compared
-      : compared * directionFactor;
-  });
-  const sortedFiles = [...items.files].sort((left, right) => {
-    let compared = 0;
-    if (sortField === "kind")
-      compared = nameCollator.compare(left.mimeType, right.mimeType);
-    else if (sortField === "size") {
-      const leftSize = BigInt(left.sizeBytes);
-      const rightSize = BigInt(right.sizeBytes);
-      compared = leftSize === rightSize ? 0 : leftSize < rightSize ? -1 : 1;
-    } else if (sortField === "originalCreated")
-      compared = compareOriginalTimes(left.originalCreatedAt, right.originalCreatedAt);
-    else if (sortField === "originalModified")
-      compared = compareOriginalTimes(left.originalModifiedAt, right.originalModifiedAt);
-    if (!compared) compared = nameCollator.compare(left.name, right.name);
-    return (sortField === "originalCreated" || sortField === "originalModified") && compared
-      ? compared
-      : compared * directionFactor;
-  });
-  const currentKeys = [
-    ...sortedFolders.map((item) => selectionKey("folder", item.id)),
-    ...sortedFiles.map((item) => selectionKey("file", item.id)),
-  ];
+  const [sortedFolders, sortedFiles] = useMemo(() => {
+    const directionFactor = sortDirection === "asc" ? 1 : -1;
+    const compareOriginalTimes = (leftTime: number, rightTime: number) => {
+      const leftKnown = Number.isFinite(leftTime);
+      const rightKnown = Number.isFinite(rightTime);
+      if (!leftKnown || !rightKnown)
+        return leftKnown ? -1 : rightKnown ? 1 : 0;
+      return (leftTime - rightTime) * directionFactor;
+    };
+    const sortByOriginalTime = <T extends { name: string }>(
+      values: T[],
+      dateValue: (value: T) => string | null | undefined,
+    ) => values
+      .map((item) => ({
+        item,
+        timestamp: Date.parse(dateValue(item) ?? ""),
+      }))
+      .sort((left, right) => {
+        const compared = compareOriginalTimes(
+          left.timestamp,
+          right.timestamp,
+        );
+        return compared || nameCollator.compare(left.item.name, right.item.name);
+      })
+      .map(({ item }) => item);
+    const dateValue = (item: {
+      originalCreatedAt?: string | null;
+      originalModifiedAt?: string | null;
+    }) => sortField === "originalCreated"
+      ? item.originalCreatedAt
+      : item.originalModifiedAt;
+    const folders = sortField === "originalCreated" ||
+        sortField === "originalModified"
+      ? sortByOriginalTime(items.folders, dateValue)
+      : [...items.folders].sort(
+          (left, right) =>
+            nameCollator.compare(left.name, right.name) * directionFactor,
+        );
+    const files = sortField === "originalCreated" ||
+        sortField === "originalModified"
+      ? sortByOriginalTime(items.files, dateValue)
+      : sortField === "size"
+        ? items.files
+            .map((item) => ({ item, size: BigInt(item.sizeBytes) }))
+            .sort((left, right) => {
+              const compared = left.size === right.size
+                ? nameCollator.compare(left.item.name, right.item.name)
+                : left.size < right.size
+                  ? -1
+                  : 1;
+              return compared * directionFactor;
+            })
+            .map(({ item }) => item)
+        : [...items.files].sort((left, right) => {
+            const compared = sortField === "kind"
+              ? nameCollator.compare(left.mimeType, right.mimeType)
+              : 0;
+            return (compared || nameCollator.compare(left.name, right.name)) *
+              directionFactor;
+          });
+    return [folders, files];
+  }, [items.files, items.folders, sortDirection, sortField]);
+  const currentKeys = useMemo(
+    () => [
+      ...sortedFolders.map((item) => selectionKey("folder", item.id)),
+      ...sortedFiles.map((item) => selectionKey("file", item.id)),
+    ],
+    [sortedFiles, sortedFolders],
+  );
   const selectItem = (
     key: string,
     modifiers: { ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean },
@@ -1616,6 +1786,13 @@ function Dashboard({
       return;
     }
     if (checkbox) {
+      if (
+        !selectedKeys.has(key) &&
+        selectedKeys.size >= BULK_SELECTION_LIMIT
+      ) {
+        setMessage("일괄 작업은 한 번에 최대 1,000개까지 선택할 수 있습니다.");
+        return;
+      }
       selectionAnchor.current = key;
       setSelectedKeys((previous) => {
         const next = new Set(previous);
@@ -1631,19 +1808,37 @@ function Dashboard({
       const anchorIndex = anchor ? currentKeys.indexOf(anchor) : -1;
       const targetIndex = currentKeys.indexOf(key);
       if (anchorIndex >= 0 && targetIndex >= 0) {
-        const range = currentKeys.slice(
-          Math.min(anchorIndex, targetIndex),
-          Math.max(anchorIndex, targetIndex) + 1,
-        );
-        setSelectedKeys((previous) =>
-          additive ? new Set([...previous, ...range]) : new Set(range),
-        );
+        const range = targetIndex >= anchorIndex
+          ? currentKeys.slice(anchorIndex, targetIndex + 1)
+          : currentKeys.slice(targetIndex, anchorIndex + 1).reverse();
+        const next = new Set(additive ? [...selectedKeys, ...range] : range);
+        const nextKeys = [...next];
+        const limitedKeys = nextKeys.length > BULK_SELECTION_LIMIT
+          ? [
+              ...nextKeys
+                .filter((candidate) => candidate !== key)
+                .slice(-(BULK_SELECTION_LIMIT - 1)),
+              key,
+            ]
+          : nextKeys;
+        if (nextKeys.length > BULK_SELECTION_LIMIT) {
+          setMessage("일괄 작업은 한 번에 최대 1,000개까지 선택할 수 있습니다.");
+          selectionAnchor.current = limitedKeys[0];
+        }
+        setSelectedKeys(new Set(limitedKeys));
         return;
       }
     }
 
     selectionAnchor.current = key;
     if (additive) {
+      if (
+        !selectedKeys.has(key) &&
+        selectedKeys.size >= BULK_SELECTION_LIMIT
+      ) {
+        setMessage("일괄 작업은 한 번에 최대 1,000개까지 선택할 수 있습니다.");
+        return;
+      }
       setSelectedKeys((previous) => {
         const next = new Set(previous);
         next.has(key) ? next.delete(key) : next.add(key);
@@ -1653,12 +1848,15 @@ function Dashboard({
       setSelectedKeys(new Set([key]));
     }
   };
-  const selections: BulkSelection[] = currentKeys
-    .filter((key) => selectedKeys.has(key))
-    .map((key) => {
-      const [type, id] = key.split(":");
-      return { type: type as "file" | "folder", id };
-    });
+  const selections = useMemo<BulkSelection[]>(
+    () => currentKeys
+      .filter((key) => selectedKeys.has(key))
+      .map((key) => {
+        const [type, id] = key.split(":");
+        return { type: type as "file" | "folder", id };
+      }),
+    [currentKeys, selectedKeys],
+  );
   const destinationContainsSelection = (
     selected: BulkSelection[],
     destinationFolderId?: string,
@@ -1680,13 +1878,32 @@ function Dashboard({
     }
     return false;
   };
-  const invalidMoveDestinationIds = new Set(
-    allFolders
-      .filter((candidate) =>
-        destinationContainsSelection(selections, candidate.id),
-      )
-      .map((candidate) => candidate.id),
-  );
+  const invalidMoveDestinationIds = useMemo(() => {
+    if (!moveOpen) return new Set<string>();
+    const selectedFolderIds = new Set(
+      selections
+        .filter((entry) => entry.type === "folder")
+        .map((entry) => entry.id),
+    );
+    if (!selectedFolderIds.size) return new Set<string>();
+    const childrenByParent = new Map<string | null, string[]>();
+    for (const candidate of allFolders) {
+      const children = childrenByParent.get(candidate.parentId) ?? [];
+      children.push(candidate.id);
+      childrenByParent.set(candidate.parentId, children);
+    }
+    const invalid = new Set(selectedFolderIds);
+    const pending = [...selectedFolderIds];
+    while (pending.length) {
+      const parentId = pending.pop()!;
+      for (const childId of childrenByParent.get(parentId) ?? []) {
+        if (invalid.has(childId)) continue;
+        invalid.add(childId);
+        pending.push(childId);
+      }
+    }
+    return invalid;
+  }, [allFolders, moveOpen, selections]);
   const showItemMenu = (
     target: ItemMenuTarget,
     key: string,
@@ -1743,15 +1960,18 @@ function Dashboard({
     }
   };
   const selectAll = () => {
-    setSelectedKeys(new Set(currentKeys.slice(0, 1_000)));
+    setSelectedKeys(new Set(currentKeys.slice(0, BULK_SELECTION_LIMIT)));
     selectionAnchor.current = currentKeys[0];
-    if (currentKeys.length > 1_000)
+    if (currentKeys.length > BULK_SELECTION_LIMIT)
       setMessage("일괄 작업은 한 번에 최대 1,000개까지 선택할 수 있습니다.");
   };
   const clearSelection = () => {
     selectionAnchor.current = undefined;
     setSelectedKeys(new Set());
   };
+  const notifySelectionLimit = useCallback(() => {
+    setMessage("일괄 작업은 한 번에 최대 1,000개까지 선택할 수 있습니다.");
+  }, [setMessage]);
   const {
     active: marqueeSelecting,
     boxRef: selectionBoxRef,
@@ -1761,10 +1981,16 @@ function Dashboard({
     itemsRef: filesSection,
     itemSelector: "[data-select-key]",
     itemDataAttribute: "data-select-key",
-    enabled: activeView === "files",
+    enabled:
+      activeView === "files" &&
+      !itemsLoading &&
+      !listingError &&
+      !bulkBusy,
     selectedKeys,
     setSelectedKeys,
     onClear: clearSelection,
+    maxSelected: BULK_SELECTION_LIMIT,
+    onSelectionLimit: notifySelectionLimit,
   });
   const storeFileClipboard = (
     mode: FileClipboard["mode"],
@@ -1950,7 +2176,6 @@ function Dashboard({
     setContextMenu(undefined);
   };
   const canAcceptDrop = (dataTransfer: DataTransfer) =>
-    internalDragActive ||
     dataTransfer.types.includes(INTERNAL_DRAG_TYPE) ||
     dataTransfer.types.includes("Files");
   const handleDropAt = (
@@ -1961,7 +2186,9 @@ function Dashboard({
     event.preventDefault();
     event.stopPropagation();
     setDropTarget(undefined);
-    let internalSelections = draggedSelections.current;
+    let internalSelections = event.dataTransfer.types.includes(INTERNAL_DRAG_TYPE)
+      ? draggedSelections.current
+      : [];
     if (
       !internalSelections.length &&
       event.dataTransfer.types.includes(INTERNAL_DRAG_TYPE)
@@ -1986,10 +2213,11 @@ function Dashboard({
       }
     }
     if (internalSelections.length) {
-      draggedSelections.current = internalSelections;
+      finishInternalDrag();
       void moveDroppedSelections(internalSelections, destination);
       return;
     }
+    finishInternalDrag();
     void enqueueDroppedFiles(event.dataTransfer, destination ?? null);
     setExternalDropActive(false);
   };
@@ -2000,9 +2228,7 @@ function Dashboard({
     if (!canAcceptDrop(event.dataTransfer)) return;
     event.preventDefault();
     event.stopPropagation();
-    const internal =
-      draggedSelections.current.length > 0 ||
-      event.dataTransfer.types.includes(INTERNAL_DRAG_TYPE);
+    const internal = event.dataTransfer.types.includes(INTERNAL_DRAG_TYPE);
     event.dataTransfer.dropEffect =
       internal ? "move" : "copy";
     if (target === "current" && internal) {
@@ -2019,6 +2245,21 @@ function Dashboard({
     if (related instanceof Node && event.currentTarget.contains(related)) return;
     setDropTarget((current) => (current === target ? undefined : current));
   };
+  useEffect(() => {
+    const clearNativeDrag = () => {
+      draggedSelections.current = [];
+      setInternalDragActive(false);
+      setDropTarget(undefined);
+    };
+    window.addEventListener("dragend", clearNativeDrag, true);
+    window.addEventListener("drop", clearNativeDrag);
+    window.addEventListener("blur", clearNativeDrag);
+    return () => {
+      window.removeEventListener("dragend", clearNativeDrag, true);
+      window.removeEventListener("drop", clearNativeDrag);
+      window.removeEventListener("blur", clearNativeDrag);
+    };
+  }, []);
   const deleteSelected = async () => {
     if (
       !window.confirm(
@@ -2133,7 +2374,7 @@ function Dashboard({
       setMessage(e instanceof Error ? e.message : "폴더 삭제 실패");
     }
   };
-  const deleteFile = async (item: VaultFile) => {
+  const deleteFile = async (item: FileListItem) => {
     if (!window.confirm(user.trashEnabled ? `“${item.name}” 파일을 휴지통으로 옮길까요? 30일 안에 복원할 수 있습니다.` : `“${item.name}” 파일을 완전히 삭제할까요?`)) return;
     try {
       await api.deleteFile(item.id);
@@ -2153,14 +2394,14 @@ function Dashboard({
       setMessage(e instanceof Error ? e.message : "파일 삭제 실패");
     }
   };
-  const openPreview = (file: VaultFile) => setPreviewFile(file);
+  const openPreview = (file: FileListItem) => setPreviewFile(file);
   const closeFileDetails = () => {
     detailRequestSequence.current += 1;
     setDetailTarget(undefined);
     setFileDetail(undefined);
     setDetailLoading(false);
   };
-  const openFileDetails = async (file: VaultFile) => {
+  const openFileDetails = async (file: FileListItem) => {
     folderDetailRequestSequence.current += 1;
     setFolderDetailTarget(undefined);
     setFolderDetail(undefined);
@@ -2214,7 +2455,7 @@ function Dashboard({
         setFolderDetailLoading(false);
     }
   };
-  const downloadFile = async (file: Pick<VaultFile, "id" | "name">) => {
+  const downloadFile = async (file: Pick<FileListItem, "id" | "name">) => {
     try {
       await api.download(file);
     } catch (error) {
@@ -2232,7 +2473,8 @@ function Dashboard({
         detailTarget ||
         folderDetailTarget ||
         moveOpen ||
-        contextMenu
+        contextMenu ||
+        itemsLoading
       )
         return;
       const target = event.target;
@@ -2262,6 +2504,7 @@ function Dashboard({
     folderDetailTarget,
     fileClipboard,
     folder?.id,
+    itemsLoading,
     moveOpen,
     navigationReady,
     previewFile,
@@ -2322,6 +2565,223 @@ function Dashboard({
     setContextMenu(undefined);
     action();
   };
+  const listingUsesManifest =
+    !itemsLoading || items.folders.length > 0 || items.files.length > 0;
+  const visibleFolderCount = listingUsesManifest
+    ? sortedFolders.length
+    : itemCounts.folderCount;
+  const visibleFileCount = listingUsesManifest
+    ? sortedFiles.length
+    : itemCounts.fileCount;
+  const visibleItemCount = visibleFolderCount + visibleFileCount;
+  const listingItemKey = (index: number) => {
+    if (index < visibleFolderCount) {
+      const folder = sortedFolders[index];
+      return folder ? selectionKey("folder", folder.id) : `folder-skeleton:${index}`;
+    }
+    const fileIndex = index - visibleFolderCount;
+    const file = sortedFiles[fileIndex];
+    return file
+      ? selectionKey("file", file.id)
+      : `file-skeleton:${fileIndex}`;
+  };
+  const renderListingItem = (index: number) => {
+    if (index < visibleFolderCount) {
+      const item = sortedFolders[index];
+      if (!item)
+        return (
+          <div className="file-card folder-card file-card-skeleton" aria-hidden="true">
+            <span className="skeleton-icon" />
+            <span className="skeleton-copy">
+              <span />
+              <span />
+            </span>
+          </div>
+        );
+      const key = selectionKey("folder", item.id);
+      const selected = selectedKeys.has(key);
+      return (
+        <div
+          data-select-key={key}
+          className={`file-card folder-card ${selected ? "selected" : ""} ${fileClipboard?.mode === "cut" && clipboardKeys.has(key) ? "clipboard-cut" : ""} ${dropTarget === key ? "drop-target" : ""}`}
+          role="checkbox"
+          aria-checked={selected}
+          tabIndex={0}
+          draggable={!bulkBusy && !itemsLoading}
+          onClick={(event) => selectItem(key, event)}
+          onDragStart={(event) =>
+            handleItemDragStart(event, { type: "folder", id: item.id }, key)
+          }
+          onDragEnd={finishInternalDrag}
+          onDragOver={(event) => markDropTarget(event, key)}
+          onDragLeave={(event) => clearDropTarget(event, key)}
+          onDrop={(event) => handleDropAt(event, item)}
+          onDoubleClick={(event) => {
+            if ((event.target as HTMLElement).closest("button")) return;
+            navigateToTrail([...trail, item]);
+          }}
+          onContextMenu={(event) =>
+            handleItemContextMenu(event, { type: "folder", item }, key)
+          }
+          onKeyDown={(event) =>
+            handleItemKeyDown(event, { type: "folder", item }, key)
+          }
+        >
+          {viewMode === "preview" ? (
+            <div className="file-preview-thumb folder-thumb" aria-hidden="true">
+              <Folder />
+            </div>
+          ) : (
+            <div className="file-icon">
+              <Folder />
+            </div>
+          )}
+          <div className="file-meta">
+            <strong>{item.name}</strong>
+            <small>
+              폴더 · 생성 {listDate(item.originalCreatedAt)} · 수정 {listDate(item.originalModifiedAt)}
+            </small>
+          </div>
+          <div className="file-actions">
+            <button
+              title="폴더 상세정보 보기"
+              aria-label={`${item.name} 상세정보 보기`}
+              onClick={(event) => {
+                event.stopPropagation();
+                void openFolderDetails(item);
+              }}
+            >
+              <Info />
+            </button>
+            <button
+              className="item-menu-trigger"
+              title="폴더 메뉴"
+              aria-label={`${item.name} 메뉴 열기`}
+              aria-haspopup="menu"
+              onClick={(event) => {
+                event.stopPropagation();
+                contextMenuAnchor.current = event.currentTarget;
+                const bounds = event.currentTarget.getBoundingClientRect();
+                showItemMenu(
+                  { type: "folder", item },
+                  key,
+                  bounds.right,
+                  bounds.bottom + 4,
+                  event.detail === 0,
+                );
+              }}
+            >
+              <MoreHorizontal />
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    const item = sortedFiles[index - visibleFolderCount];
+    if (!item)
+      return (
+        <div className="file-card file-card-skeleton" aria-hidden="true">
+          <span className="skeleton-icon" />
+          <span className="skeleton-copy">
+            <span />
+            <span />
+          </span>
+        </div>
+      );
+    const Icon = item.mimeType.startsWith("image/")
+      ? FileImage
+      : item.mimeType.startsWith("video/")
+        ? FileVideo
+        : File;
+    const key = selectionKey("file", item.id);
+    const selected = selectedKeys.has(key);
+    return (
+      <div
+        data-select-key={key}
+        className={`file-card ${selected ? "selected" : ""} ${fileClipboard?.mode === "cut" && clipboardKeys.has(key) ? "clipboard-cut" : ""}`}
+        role="checkbox"
+        aria-checked={selected}
+        tabIndex={0}
+        draggable={!bulkBusy && !itemsLoading}
+        onClick={(event) => selectItem(key, event)}
+        onDragStart={(event) =>
+          handleItemDragStart(event, { type: "file", id: item.id }, key)
+        }
+        onDragEnd={finishInternalDrag}
+        onDoubleClick={(event) => {
+          if ((event.target as HTMLElement).closest("button")) return;
+          openPreview(item);
+        }}
+        onContextMenu={(event) =>
+          handleItemContextMenu(event, { type: "file", item }, key)
+        }
+        onKeyDown={(event) =>
+          handleItemKeyDown(event, { type: "file", item }, key)
+        }
+      >
+        {viewMode === "preview" ? (
+          <LazyFileThumbnail
+            fileId={item.id}
+            fileName={item.name}
+            mimeType={item.mimeType}
+            version={item.version}
+            kind={
+              item.mimeType.startsWith("image/")
+                ? "image"
+                : item.mimeType.startsWith("video/")
+                  ? "video"
+                  : "unsupported"
+            }
+            source="files"
+            fallback={Icon}
+          />
+        ) : (
+          <div className="file-icon">
+            <Icon />
+          </div>
+        )}
+        <div className="file-meta">
+          <strong>{item.name}</strong>
+          <small>
+            {formatBytes(item.sizeBytes)} · 생성 {listDate(item.originalCreatedAt)} · 수정 {listDate(item.originalModifiedAt)}
+          </small>
+        </div>
+        <div className="file-actions">
+          <button
+            title="상세정보 보기"
+            aria-label={`${item.name} 상세정보 보기`}
+            onClick={(event) => {
+              event.stopPropagation();
+              void openFileDetails(item);
+            }}
+          >
+            <Info />
+          </button>
+          <button
+            className="item-menu-trigger"
+            title="파일 메뉴"
+            aria-label={`${item.name} 메뉴 열기`}
+            aria-haspopup="menu"
+            onClick={(event) => {
+              event.stopPropagation();
+              contextMenuAnchor.current = event.currentTarget;
+              const bounds = event.currentTarget.getBoundingClientRect();
+              showItemMenu(
+                { type: "file", item },
+                key,
+                bounds.right,
+                bounds.bottom + 4,
+                event.detail === 0,
+              );
+            }}
+          >
+            <MoreHorizontal />
+          </button>
+        </div>
+      </div>
+    );
+  };
   return (
     <div
       className="app-shell"
@@ -2333,6 +2793,7 @@ function Dashboard({
           event.dataTransfer.types.includes(INTERNAL_DRAG_TYPE)
         )
           return;
+        if (internalDragActive) finishInternalDrag();
         externalDragDepth.current += 1;
         setExternalDropActive(true);
       }}
@@ -2381,6 +2842,7 @@ function Dashboard({
         if (
           activeView === "files" &&
           navigationReady &&
+          !itemsLoading &&
           target.closest(".files-section, .breadcrumbs")
         ) {
           setContextMenu({
@@ -2612,7 +3074,7 @@ function Dashboard({
             />
             <div className="listing-tools">
               <ListingControls
-                itemCount={items.folders.length + items.files.length}
+                itemCount={visibleItemCount}
                 sortField={sortField}
                 sortDirection={sortDirection}
                 viewMode={viewMode}
@@ -2624,7 +3086,7 @@ function Dashboard({
             <SelectionToolbar
               selectedCount={selections.length}
               totalCount={currentKeys.length}
-              busy={bulkBusy}
+              busy={bulkBusy || itemsLoading}
               onSelectAll={selectAll}
               onClear={clearSelection}
               onDownloadOriginals={() => void downloadOriginals()}
@@ -2639,6 +3101,7 @@ function Dashboard({
             <section
               ref={filesSection}
               className={`files-section ${bulkBusy ? "bulk-busy" : ""} ${dropTarget === "current" ? "drop-target" : ""}`}
+              aria-busy={itemsLoading}
               onDragOver={(event) => markDropTarget(event, "current")}
               onDragLeave={(event) => clearDropTarget(event, "current")}
               onDrop={(event) => handleDropAt(event, folder)}
@@ -2647,7 +3110,44 @@ function Dashboard({
                 ref={selectionBoxRef}
                 className={`selection-box main-selection-box marquee-selection-box ${marqueeSelecting ? "active" : ""}`}
               />{" "}
-              {!items.folders.length && !items.files.length && !folder ? (
+              {folder && (
+                <div className={`file-grid view-${viewMode} parent-folder-grid`}>
+                  <button
+                    type="button"
+                    className={`parent-folder-card ${dropTarget === "parent" ? "drop-target" : ""}`}
+                    onClick={() => navigateToTrail(trail.slice(0, -1))}
+                    onDragOver={(event) => markDropTarget(event, "parent")}
+                    onDragLeave={(event) => clearDropTarget(event, "parent")}
+                    onDrop={(event) => handleDropAt(event, parentFolder)}
+                  >
+                    <CornerUpLeft />
+                    <span>
+                      <strong>상위 폴더</strong>
+                      <small>{parentFolder?.name ?? "내 파일"}(으)로 이동</small>
+                    </span>
+                  </button>
+                </div>
+              )}
+              {listingError ? (
+                <div className="empty" role="alert">
+                  <div>
+                    <FolderOpen />
+                  </div>
+                  <h3>파일 목록을 불러오지 못했습니다</h3>
+                  <p>{listingError}</p>
+                  <button className="secondary" onClick={() => void load()}>
+                    <RefreshCw /> 다시 시도
+                  </button>
+                </div>
+              ) : itemsLoading && visibleItemCount === 0 ? (
+                <div className="empty" role="status">
+                  <div>
+                    <RefreshCw className="spin" />
+                  </div>
+                  <h3>파일 목록을 불러오고 있습니다</h3>
+                  <p>현재 폴더의 항목 수를 확인하고 있습니다.</p>
+                </div>
+              ) : visibleItemCount === 0 && !folder ? (
                 <div
                   className={`empty ${dropTarget === "current" ? "drop-target" : ""}`}
                 >
@@ -2657,228 +3157,24 @@ function Dashboard({
                   <h3>첫 번째 원본을 보관하세요</h3>
                   <p>파일을 여기로 끌어다 놓거나 업로드 버튼을 누르세요.</p>
                 </div>
-              ) : (
-                <div className={`file-grid view-${viewMode}`}>
-                  {folder && (
-                    <button
-                      type="button"
-                      className={`parent-folder-card ${dropTarget === "parent" ? "drop-target" : ""}`}
-                      onClick={() => navigateToTrail(trail.slice(0, -1))}
-                      onDragOver={(event) => markDropTarget(event, "parent")}
-                      onDragLeave={(event) => clearDropTarget(event, "parent")}
-                      onDrop={(event) => handleDropAt(event, parentFolder)}
-                    >
-                      <CornerUpLeft />
-                      <span>
-                        <strong>상위 폴더</strong>
-                        <small>{parentFolder?.name ?? "내 파일"}(으)로 이동</small>
-                      </span>
-                    </button>
-                  )}
-                  {!items.folders.length && !items.files.length && (
-                    <div className="empty empty-in-grid">
-                      <div>
-                        <FolderOpen />
-                      </div>
-                      <h3>이 폴더는 비어 있습니다</h3>
-                      <p>파일을 업로드하거나 빈 곳을 우클릭해 붙여넣으세요.</p>
-                    </div>
-                  )}
-                  {sortedFolders.map((item) => {
-                    const key = selectionKey("folder", item.id),
-                      selected = selectedKeys.has(key);
-                    return (
-                      <div
-                        data-select-key={key}
-                        className={`file-card folder-card ${selected ? "selected" : ""} ${fileClipboard?.mode === "cut" && clipboardKeys.has(key) ? "clipboard-cut" : ""} ${dropTarget === key ? "drop-target" : ""}`}
-                        key={item.id}
-                        role="checkbox"
-                        aria-checked={selected}
-                        tabIndex={0}
-                        draggable={selected && !bulkBusy}
-                        onClick={(event) => selectItem(key, event)}
-                        onDragStart={(event) =>
-                          handleItemDragStart(
-                            event,
-                            { type: "folder", id: item.id },
-                            key,
-                          )
-                        }
-                        onDragEnd={finishInternalDrag}
-                        onDragOver={(event) => markDropTarget(event, key)}
-                        onDragLeave={(event) => clearDropTarget(event, key)}
-                        onDrop={(event) => handleDropAt(event, item)}
-                        onDoubleClick={(event) => {
-                          if ((event.target as HTMLElement).closest("button"))
-                            return;
-                          navigateToTrail([...trail, item]);
-                        }}
-                        onContextMenu={(event) =>
-                          handleItemContextMenu(
-                            event,
-                            { type: "folder", item },
-                            key,
-                          )
-                        }
-                        onKeyDown={(event) =>
-                          handleItemKeyDown(
-                            event,
-                            { type: "folder", item },
-                            key,
-                          )
-                        }
-                      >
-                        {viewMode === "preview" ? (
-                          <div className="file-preview-thumb folder-thumb" aria-hidden="true">
-                            <Folder />
-                          </div>
-                        ) : (
-                          <div className="file-icon">
-                            <Folder />
-                          </div>
-                        )}
-                        <div className="file-meta">
-                          <strong>{item.name}</strong>
-                          <small>
-                            폴더 · 생성 {listDate(item.originalCreatedAt)} · 수정 {listDate(item.originalModifiedAt)}
-                          </small>
-                        </div>
-                        <div className="file-actions">
-                          <button
-                            title="폴더 상세정보 보기"
-                            aria-label={`${item.name} 상세정보 보기`}
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              void openFolderDetails(item);
-                            }}
-                          >
-                            <Info />
-                          </button>
-                          <button
-                            className="item-menu-trigger"
-                            title="폴더 메뉴"
-                            aria-label={`${item.name} 메뉴 열기`}
-                            aria-haspopup="menu"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              contextMenuAnchor.current = e.currentTarget;
-                              const bounds =
-                                e.currentTarget.getBoundingClientRect();
-                              showItemMenu(
-                                { type: "folder", item },
-                                key,
-                                bounds.right,
-                                bounds.bottom + 4,
-                                e.detail === 0,
-                              );
-                            }}
-                          >
-                            <MoreHorizontal />
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
-                  {sortedFiles.map((item) => {
-                    const Icon = item.mimeType.startsWith("image/")
-                        ? FileImage
-                        : item.mimeType.startsWith("video/")
-                          ? FileVideo
-                          : File,
-                      key = selectionKey("file", item.id),
-                      selected = selectedKeys.has(key);
-                    return (
-                      <div
-                        data-select-key={key}
-                        className={`file-card ${selected ? "selected" : ""} ${fileClipboard?.mode === "cut" && clipboardKeys.has(key) ? "clipboard-cut" : ""}`}
-                        key={item.id}
-                        role="checkbox"
-                        aria-checked={selected}
-                        tabIndex={0}
-                        draggable={selected && !bulkBusy}
-                        onClick={(event) => selectItem(key, event)}
-                        onDragStart={(event) =>
-                          handleItemDragStart(
-                            event,
-                            { type: "file", id: item.id },
-                            key,
-                          )
-                        }
-                        onDragEnd={finishInternalDrag}
-                        onDoubleClick={(event) => {
-                          if ((event.target as HTMLElement).closest("button"))
-                            return;
-                          openPreview(item);
-                        }}
-                        onContextMenu={(event) =>
-                          handleItemContextMenu(
-                            event,
-                            { type: "file", item },
-                            key,
-                          )
-                        }
-                        onKeyDown={(event) =>
-                          handleItemKeyDown(event, { type: "file", item }, key)
-                        }
-                      >
-                        {viewMode === "preview" ? (
-                          <LazyFileThumbnail
-                            fileId={item.id}
-                            fileName={item.name}
-                            mimeType={item.mimeType}
-                            version={item.sha256}
-                            kind={item.mimeType.startsWith("image/") ? "image" : item.mimeType.startsWith("video/") ? "video" : "unsupported"}
-                            source="files"
-                            fallback={Icon}
-                          />
-                        ) : (
-                          <div className="file-icon">
-                            <Icon />
-                          </div>
-                        )}
-                        <div className="file-meta">
-                          <strong>{item.name}</strong>
-                          <small>
-                            {formatBytes(item.sizeBytes)} · 생성 {listDate(item.originalCreatedAt)} · 수정 {listDate(item.originalModifiedAt)}
-                          </small>
-                        </div>
-                        <div className="file-actions">
-                          <button
-                            title="상세정보 보기"
-                            aria-label={`${item.name} 상세정보 보기`}
-                            onClick={(event) => {
-                              event.stopPropagation();
-                              void openFileDetails(item);
-                            }}
-                          >
-                            <Info />
-                          </button>
-                          <button
-                            className="item-menu-trigger"
-                            title="파일 메뉴"
-                            aria-label={`${item.name} 메뉴 열기`}
-                            aria-haspopup="menu"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              contextMenuAnchor.current = e.currentTarget;
-                              const bounds =
-                                e.currentTarget.getBoundingClientRect();
-                              showItemMenu(
-                                { type: "file", item },
-                                key,
-                                bounds.right,
-                                bounds.bottom + 4,
-                                e.detail === 0,
-                              );
-                            }}
-                          >
-                            <MoreHorizontal />
-                          </button>
-                        </div>
-                      </div>
-                    );
-                  })}
+              ) : visibleItemCount === 0 ? (
+                <div className="empty">
+                  <div>
+                    <FolderOpen />
+                  </div>
+                  <h3>이 폴더는 비어 있습니다</h3>
+                  <p>파일을 업로드하거나 빈 곳을 우클릭해 붙여넣으세요.</p>
                 </div>
+              ) : (
+                <VirtualizedFileGrid
+                  key={`${folder?.id ?? "root"}:${viewMode}`}
+                  itemCount={visibleItemCount}
+                  viewMode={viewMode}
+                  itemKey={listingItemKey}
+                  renderItem={renderListingItem}
+                  resetKey={`${folder?.id ?? "root"}:${sortField}:${sortDirection}:${listingUsesManifest ? "manifest" : "skeleton"}`}
+                  inactive={itemsLoading && listingUsesManifest}
+                />
               )}
             </section>
           </section>
@@ -3462,7 +3758,7 @@ function Dashboard({
         <MoveDialog
           folders={allFolders}
           destinationId={moveDestination}
-          busy={bulkBusy}
+          busy={bulkBusy || itemsLoading}
           disabledFolderIds={invalidMoveDestinationIds}
           onDestinationChange={setMoveDestination}
           onCancel={() => setMoveOpen(false)}
@@ -3481,7 +3777,7 @@ function Dashboard({
       {activeView === "files" && navigationReady && shareDialogTarget && (
         <ShareDialog
           item={shareDialogTarget}
-          busy={bulkBusy}
+          busy={bulkBusy || itemsLoading}
           onCancel={() => setShareDialogTarget(undefined)}
           onConfirm={(input) => void createShare(input)}
         />

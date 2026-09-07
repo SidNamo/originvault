@@ -112,7 +112,10 @@ export function UploadQueue({
     }),
     [tasks],
   );
-  const errorTask = tasks.find((task) => task.id === errorTaskId);
+  const errorTask = useMemo(
+    () => tasks.find((task) => task.id === errorTaskId),
+    [errorTaskId, tasks],
+  );
   useEffect(() => {
     if (counts.failed > previousFailedCount.current) {
       setCollapsed(false);
@@ -133,38 +136,55 @@ export function UploadQueue({
     document.addEventListener("keydown", close);
     return () => document.removeEventListener("keydown", close);
   }, [errorTask, errorTaskId]);
-  const totalBytes = tasks.reduce((sum, task) => sum + task.sizeBytes, 0);
-  const completedBytes = tasks.reduce(
-    (sum, task) => sum + taskProgressBytes(task),
-    0,
-  );
+  const {
+    totalBytes,
+    completedBytes,
+    folderCount,
+    resumablePausedCount,
+  } = useMemo(() => {
+    let total = 0;
+    let completed = 0;
+    let resumablePaused = 0;
+    const folders = new Set<string>();
+    for (const task of tasks) {
+      total += task.sizeBytes;
+      completed += taskProgressBytes(task);
+      if (task.status === "paused" && task.file) resumablePaused += 1;
+      if (task.relativeDirectory) {
+        folders.add(
+          `${task.destinationFolderId ?? "root"}\u0000${task.relativeDirectory}`,
+        );
+      }
+    }
+    return {
+      totalBytes: total,
+      completedBytes: completed,
+      folderCount: folders.size,
+      resumablePausedCount: resumablePaused,
+    };
+  }, [tasks]);
   const overallProgress = totalBytes
     ? Math.round((completedBytes / totalBytes) * 100)
     : tasks.length
       ? Math.round((counts.completed / tasks.length) * 100)
       : 0;
-  const visible =
-    filter === "all" ? tasks : tasks.filter((task) => task.status === filter);
+  const visible = useMemo(
+    () => filter === "all"
+      ? tasks
+      : tasks.filter((task) => task.status === filter),
+    [filter, tasks],
+  );
   const groups = useMemo(() => {
     const result = new Map<string, UploadTask[]>();
     for (const task of visible) {
       const key = `${task.destinationFolderId ?? "root"}\u0000${task.relativeDirectory || "__files__"}`;
-      result.set(key, [...(result.get(key) ?? []), task]);
+      const group = result.get(key);
+      if (group) group.push(task);
+      else result.set(key, [task]);
     }
     return [...result.entries()];
   }, [visible]);
-  const folderCount = new Set(
-    tasks
-      .filter((task) => task.relativeDirectory)
-      .map(
-        (task) =>
-          `${task.destinationFolderId ?? "root"}\u0000${task.relativeDirectory}`,
-      ),
-  ).size;
   const activeCount = counts.preparing + counts.queued + counts.uploading;
-  const resumablePausedCount = tasks.filter(
-    (task) => task.status === "paused" && task.file,
-  ).length;
   const canCancel = activeCount + counts.paused + counts.failed > 0;
 
   if (!tasks.length) return null;

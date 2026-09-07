@@ -244,6 +244,25 @@ const migrations: Migration[] = [{
     CREATE INDEX IF NOT EXISTS webdav_tokens_user_created_idx ON webdav_tokens(user_id,created_at DESC);
     `);
   },
+}, {
+  version: '20260902_002_direct_listing_indexes',
+  up: async (client) => {
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS folders_user_active_parent_name_listing_idx
+        ON folders(user_id,parent_id,name,id) WHERE trashed_at IS NULL;
+      CREATE INDEX IF NOT EXISTS files_user_active_folder_created_listing_idx
+        ON files(user_id,folder_id,created_at DESC,id DESC) WHERE trashed_at IS NULL;
+    `);
+  },
+}, {
+  version: '20260902_003_direct_file_name_listing_index',
+  up: async (client) => {
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS files_user_active_folder_name_listing_idx
+        ON files(user_id,folder_id,stored_name,id) WHERE trashed_at IS NULL;
+      DROP INDEX IF EXISTS files_user_active_folder_created_listing_idx;
+    `);
+  },
 }];
 
 async function ensureMigrationTable(client: PoolClient): Promise<void> {

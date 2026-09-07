@@ -20,6 +20,19 @@ export interface FolderDetail extends Folder {
   folderCount: number;
   sizeBytes: string;
 }
+export interface FileListItem {
+  id: string;
+  name: string;
+  mimeType: string;
+  sizeBytes: string;
+  originalCreatedAt?: string | null;
+  originalModifiedAt?: string | null;
+  version: string;
+}
+export interface ItemManifest {
+  folders: Folder[];
+  files: FileListItem[];
+}
 export interface VaultFile {
   id: string;
   name: string;
@@ -369,10 +382,23 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ showHiddenFiles }),
     }),
-  items: (folderId?: string) =>
-    request<{ folders: Folder[]; files: VaultFile[] }>(
-      `/items${folderId ? `?folderId=${encodeURIComponent(folderId)}` : ""}`,
-    ),
+  itemCounts: (folderId?: string, signal?: AbortSignal) => {
+    const params = new URLSearchParams();
+    if (folderId) params.set("folderId", folderId);
+    const query = params.toString();
+    return request<{ folderCount: number; fileCount: number }>(
+      `/items/count${query ? `?${query}` : ""}`,
+      { signal },
+    );
+  },
+  items: (folderId?: string, signal?: AbortSignal) => {
+    const params = new URLSearchParams();
+    if (folderId) params.set("folderId", folderId);
+    const query = params.toString();
+    return request<ItemManifest>(`/items${query ? `?${query}` : ""}`, {
+      signal,
+    });
+  },
   folderTree: () => request<{ folders: Folder[] }>("/folders/tree"),
   folder: (id: string) => request<FolderDetail>(`/folders/${id}`),
   createFolder: (name: string, parentId?: string) =>
@@ -806,9 +832,10 @@ export const api = {
       const body = await response.json().catch(() => ({}));
       throw new Error(body.error ?? "Text file could not be saved");
     }
+    const file = (await response.json()) as SavedPreviewFile;
     return {
-      file: (await response.json()) as SavedPreviewFile,
-      etag: response.headers.get("ETag") ?? "",
+      file,
+      etag: `"sha256-${file.sha256}"`,
     };
   },
   upload: (file: File, folderId?: string, relativeDirectory = "") => {
