@@ -21,6 +21,7 @@ import {
 } from './mutationJournal.js';
 import { assertStorageAvailable, getStorageUsage, StorageQuotaError, type StorageUsage } from './quota.js';
 import { extractMetadata, isHiddenResource, originalCreatedAtFromMetadata, resolveInside, safeSegment, userFilesRoot } from './storage.js';
+import { prepareFileThumbnail } from './thumbnails.js';
 import { pruneEmptyActiveFolders, removeEmptyActiveFolderPaths } from './folderCleanup.js';
 import { moveSelectionsToTrash } from './trash.js';
 
@@ -555,6 +556,12 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
     await client.query('COMMIT');
     transactionStarted = false;
     committed = true;
+    await prepareFileThumbnail({
+      sourcePath: targetPath,
+      sha256,
+      name,
+      mimeType,
+    });
     logForRequest(req).info({
       event: 'webdav_put_completed',
       relativePath: targetRelativePath,

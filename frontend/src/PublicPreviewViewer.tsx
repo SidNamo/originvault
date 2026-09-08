@@ -173,7 +173,7 @@ export function PublicPreviewViewer({
             ) : file.kind === "audio" ? (
               <div className="preview-audio-stage"><Music /><strong>{file.name}</strong><audio src={streamUrl} controls autoPlay /></div>
             ) : file.kind === "pdf" ? (
-              <div className="preview-pdf-wrap"><iframe className="preview-pdf" src={streamUrl} title={`${file.name} PDF 미리보기`} sandbox="allow-downloads" /></div>
+              <div className="preview-pdf-wrap"><iframe className="preview-pdf" src={streamUrl} title={`${file.name} PDF 미리보기`} referrerPolicy="no-referrer" /></div>
             ) : textLike ? (
               <div className="preview-text-layout">
                 <div className="text-toolbar">

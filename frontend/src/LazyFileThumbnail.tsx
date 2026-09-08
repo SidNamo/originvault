@@ -145,7 +145,7 @@ export function LazyFileThumbnail({
   fileName: string;
   mimeType?: string;
   version: string;
-  kind: "image" | "video" | "unsupported";
+  kind: "image" | "video" | "pdf" | "unsupported";
   source: ThumbnailSource;
   shareToken?: string;
   fallback: ComponentType<{ size?: number }>;
@@ -167,11 +167,13 @@ export function LazyFileThumbnail({
     ticket?.key === resourceKey && ticket.expiresAt > Date.now()
       ? ticket.url
       : "";
-  const previewable = kind === "image" || kind === "video";
+  const previewable = kind === "image" || kind === "video" || kind === "pdf";
   const nativeOnlyImage = kind === "image" && (
     mimeType?.split(";", 1)[0]?.trim().toLowerCase() === "image/svg+xml" ||
     /\.svgz?$/i.test(fileName)
   );
+  const pausableImage = kind === "image" || kind === "pdf";
+  const serverThumbnail = kind === "pdf" || (kind === "image" && !nativeOnlyImage);
   const handlePreviewRequestError = (failedUrl: string, status?: number) => {
     if (!failedUrl || failedUrl !== previewUrl) return;
     const canRefreshTicket = status === 401 || status === 403 || status === 404;
@@ -185,7 +187,7 @@ export function LazyFileThumbnail({
   };
   const imageUrl = usePausableImage({
     active: nearViewport,
-    enabled: kind === "image" && !nativeOnlyImage && !previewFailed,
+    enabled: pausableImage && !previewFailed,
     resourceKey,
     url: previewUrl || undefined,
     onRequestError: handlePreviewRequestError,
@@ -243,15 +245,18 @@ export function LazyFileThumbnail({
 
   useEffect(() => {
     const cachedImageReady =
-      kind === "image" &&
-      !nativeOnlyImage &&
+      pausableImage &&
       (Boolean(imageUrl) || hasCachedPausableImage(resourceKey));
     if (!nearViewport || !previewable || previewUrl || cachedImageReady) return;
     let disposed = false;
     let retryTimer: number | undefined;
     const request = (signal: AbortSignal) => source === "public"
       ? shareToken
-        ? Promise.resolve(`${api.publicSharePreviewUrl(shareToken, fileId)}?v=${encodeURIComponent(version)}`)
+        ? Promise.resolve(`${
+            serverThumbnail
+              ? api.publicShareThumbnailUrl(shareToken, fileId)
+              : api.publicSharePreviewUrl(shareToken, fileId)
+          }?v=${encodeURIComponent(version)}`)
         : Promise.reject(new Error("A public share token is required"))
       : source === "trash"
         ? api.trashFilePreviewTicket(fileId, signal)
@@ -283,15 +288,14 @@ export function LazyFileThumbnail({
       disposed = true;
       if (retryTimer !== undefined) window.clearTimeout(retryTimer);
     };
-  }, [fileId, imageUrl, kind, nativeOnlyImage, nearViewport, previewUrl, previewable, resourceKey, shareToken, source, ticketRequestAttempt, version]);
+  }, [fileId, imageUrl, nearViewport, pausableImage, previewUrl, previewable, resourceKey, serverThumbnail, shareToken, source, ticketRequestAttempt, version]);
 
-  const nativeImageUrl = nativeOnlyImage ? previewUrl : undefined;
   const videoUrl = nearViewport && kind === "video" ? previewUrl : undefined;
   return (
     <div ref={containerRef} className="file-preview-thumb" aria-hidden="true">
-      {!previewFailed && (imageUrl || nativeImageUrl) && kind === "image" ? (
+      {!previewFailed && imageUrl && pausableImage ? (
         <img
-          src={imageUrl || nativeImageUrl}
+          src={imageUrl}
           alt=""
           draggable={false}
           onLoad={() => {
@@ -301,11 +305,8 @@ export function LazyFileThumbnail({
             );
           }}
           onError={() =>
-            nativeImageUrl || imageUrl === previewUrl
-              ? handlePreviewRequestError(
-                  nativeImageUrl || previewUrl,
-                  404,
-                )
+            imageUrl === previewUrl
+              ? handlePreviewRequestError(previewUrl, 404)
               : setFailedResourceKey(resourceKey)
           }
         />

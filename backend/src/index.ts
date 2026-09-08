@@ -23,6 +23,7 @@ import { filePreviewRouter } from './filePreview.js';
 import { reconcileMutationJournals } from './mutationJournal.js';
 import { createRateLimiter } from './rateLimit.js';
 import { migrateLegacyTrashStorage, purgeExpiredTrash, TrashError, trashRouter, trashSelections } from './trash.js';
+import { prepareFileThumbnail, pruneUnusedThumbnails } from './thumbnails.js';
 
 const app = express();
 const registrationRateLimit = createRateLimiter({ windowMs: 60 * 60 * 1_000, max: 5 });
@@ -451,6 +452,12 @@ app.post('/api/files/upload', requireAuth, (req, res, next) => {
           await assertStorageAvailable(req.user!.id, BigInt(stored.size), client);
           const result = await client.query(`INSERT INTO files(user_id, folder_id, original_name, stored_name, relative_path, mime_type, size_bytes, sha256, client_last_modified, extracted_metadata, is_hidden, original_created_at)
             VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`, [req.user!.id, destinationFolderId, originalName, stored.storedName, stored.relativePath, mimeType, stored.size, stored.sha256, clientLastModified ?? null, metadata, isHiddenResource(stored.storedName, metadata), originalCreatedAtFromMetadata(metadata) ?? null]);
+          await prepareFileThumbnail({
+            sourcePath: stored.absolutePath,
+            sha256: stored.sha256,
+            name: stored.storedName,
+            mimeType,
+          });
           await client.query('COMMIT');
           committed = true;
           logForRequest(req).info({ event: 'upload_completed', fileId: result.rows[0].id, folderId: destinationFolderId, originalName, storedName: stored.storedName, relativePath: stored.relativePath, mimeType, sizeBytes: stored.size, sha256: stored.sha256, metadataFieldCount: Object.keys(metadata).length }, 'Original upload stored and indexed');
@@ -599,6 +606,27 @@ app.use((error: any, _req: express.Request, res: express.Response, _next: expres
   return res.status(500).json({ error: 'Internal server error' });
 });
 
+let thumbnailCleanupRunning = false;
+
+async function purgeUnusedThumbnailCache(): Promise<void> {
+  if (thumbnailCleanupRunning) return;
+  thumbnailCleanupRunning = true;
+  try {
+    const files = await db.query<{ sha256: string }>('SELECT DISTINCT sha256 FROM files');
+    const referencedHashes = new Set(files.rows.map((file) => file.sha256.toLowerCase()));
+    const result = await pruneUnusedThumbnails(referencedHashes);
+    const details = { event: 'thumbnail_cache_cleanup_completed', referencedHashes: referencedHashes.size, ...result };
+    if (result.removedFiles || result.failedFiles)
+      logger.info(details, 'Unused thumbnail cache cleanup completed');
+    else
+      logger.debug(details, 'Thumbnail cache cleanup found no unused files');
+  } catch (error) {
+    logger.error({ event: 'thumbnail_cache_cleanup_failed', err: error }, 'Unused thumbnail cache cleanup failed');
+  } finally {
+    thumbnailCleanupRunning = false;
+  }
+}
+
 async function start(): Promise<void> {
   const unsafeSecret = (value: string) => value.length < 32 || /development|change|replace|example/i.test(value);
   if (unsafeSecret(config.jwtSecret)) throw new Error('JWT_SECRET must be set to a strong random value');
@@ -630,8 +658,11 @@ async function start(): Promise<void> {
   await reconcileMutationJournals();
   await migrateLegacyTrashStorage();
   await purgeExpiredTrash();
+  await purgeUnusedThumbnailCache();
   const trashCleanupTimer = setInterval(() => { void purgeExpiredTrash(); }, 6 * 60 * 60 * 1_000);
   trashCleanupTimer.unref();
+  const thumbnailCleanupTimer = setInterval(() => { void purgeUnusedThumbnailCache(); }, 6 * 60 * 60 * 1_000);
+  thumbnailCleanupTimer.unref();
   const server = app.listen(config.port, () => logger.info({ event: 'service_ready', port: config.port }, 'OriginVault backend is ready'));
   // Node's default five-minute limit cuts off valid multi-gigabyte WebDAV uploads.
   const largeRequestTimeoutMs = 30 * 60 * 1_000;
@@ -641,6 +672,7 @@ async function start(): Promise<void> {
     logger.warn({ event: 'service_shutdown_started', signal }, 'OriginVault backend shutdown started');
     server.close(async (error) => {
       clearInterval(trashCleanupTimer);
+      clearInterval(thumbnailCleanupTimer);
       if (error) logger.error({ event: 'http_server_close_failed', err: error }, 'HTTP server close failed');
       await instanceLockClient.query("SELECT pg_advisory_unlock(hashtext('originvault:backend-instance'))").catch((lockError) => logger.error({ event: 'instance_lock_release_failed', err: lockError }, 'Backend instance lock release failed'));
       instanceLockClient.release();

@@ -7,7 +7,7 @@ COPY src ./src
 RUN npm run build
 
 FROM node:24-alpine
-RUN apk add --no-cache exiftool su-exec
+RUN apk add --no-cache exiftool poppler-utils su-exec
 WORKDIR /app
 ENV NODE_ENV=production
 COPY package*.json ./

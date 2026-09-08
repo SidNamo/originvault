@@ -21,6 +21,7 @@ import { db } from './db.js';
 import { logForRequest, logger } from './logger.js';
 import { assertStorageAvailable, StorageQuotaError } from './quota.js';
 import { extractMetadata, isHiddenResource, originalCreatedAtFromMetadata, resolveInside, safeRelativeDirectory, safeSegment, userFilesRoot } from './storage.js';
+import { prepareFileThumbnail } from './thumbnails.js';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SESSION_ROUTE = '/api/upload-sessions';
@@ -732,6 +733,12 @@ async function finalizeSession(user: SessionUser, sessionId: string, knownFileId
       const sha256 = await hashFile(finalPath);
       const metadata = await extractMetadata(finalPath);
       const completed = await commitCompletedFile(client, user, session, sha256, metadata);
+      await prepareFileThumbnail({
+        sourcePath: finalPath,
+        sha256,
+        name: session.storedName ?? session.originalName,
+        mimeType: session.mimeType,
+      });
       await unlink(partPath).catch((error) => logger.warn({ event: 'completed_upload_part_cleanup_failed', userId: user.id, sessionId, err: error }, 'Completed upload part file could not be removed'));
       await rm(chunkDirectory(user, sessionId), { recursive: true, force: true }).catch((error) => logger.warn({ event: 'completed_upload_chunk_directory_cleanup_failed', userId: user.id, sessionId, err: error }, 'Completed upload staging directory could not be removed'));
       logger.info({

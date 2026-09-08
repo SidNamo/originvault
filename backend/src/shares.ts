@@ -29,6 +29,12 @@ import { logForRequest } from './logger.js';
 import { extractMetadata, isHiddenResource, originalCreatedAtFromMetadata, resolveInside, storeOriginal, userFilesRoot } from './storage.js';
 import { pruneEmptyActiveFolders, removeEmptyActiveFolderPaths } from './folderCleanup.js';
 import { moveSelectionsToTrash } from './trash.js';
+import {
+  getOrCreateThumbnail,
+  prepareFileThumbnail,
+  sendThumbnail,
+  thumbnailKind,
+} from './thumbnails.js';
 
 export class ShareError extends Error {
   constructor(readonly statusCode: number, message: string) { super(message); }
@@ -1175,6 +1181,12 @@ export function createShareRouter(): express.Router {
               share.ownerUserId, destination.id, originalName, stored.storedName,
               stored.relativePath, mimeType, stored.size, stored.sha256, metadata, isHiddenResource(stored.storedName, metadata), originalCreatedAtFromMetadata(metadata) ?? null,
             ]);
+            await prepareFileThumbnail({
+              sourcePath: stored.absolutePath,
+              sha256: stored.sha256,
+              name: stored.storedName,
+              mimeType,
+            });
             await client.query('COMMIT');
             committed = true;
             logForRequest(req).warn({ event: 'public_share_upload_completed', shareId: share.id, folderId: destination.id, fileId: inserted.rows[0]!.id, sizeBytes: stored.size }, 'Public share upload completed');
@@ -1427,6 +1439,9 @@ export function createShareRouter(): express.Router {
     const etag = setPublicFileHeaders(res, file, inlineDisposition(file.name));
     res.setHeader('Content-Type', responseMime);
     res.setHeader('Accept-Ranges', 'bytes');
+    if (responseMime === 'application/pdf') {
+      res.setHeader('Content-Security-Policy', "frame-ancestors 'self'");
+    }
     if (responseMime === 'image/svg+xml')
       res.setHeader('Content-Security-Policy', "sandbox; default-src 'none'; style-src 'unsafe-inline'");
     if (req.header('if-match') && !etagMatches(req.header('if-match'), etag, false)) {
@@ -1477,6 +1492,41 @@ export function createShareRouter(): express.Router {
   router.route('/api/public/shares/:token/files/:fileId/preview')
     .head(publicPreviewHandler)
     .get(publicPreviewHandler);
+
+  const publicThumbnailHandler = asyncHandler(async (req, res) => {
+    const generated = await withActiveShareReadLock(req, async (share, client) => {
+      const file = await sharedFile(
+        share,
+        requestUuid(req.params.fileId, 'File not found'),
+        client,
+      );
+      if (!thumbnailKind(file.name, file.mimeType))
+        throw new ShareError(415, 'This file does not support a server thumbnail');
+      const opened = await openSharedRegularFile(share, file);
+      try {
+        const thumbnail = await getOrCreateThumbnail({
+          sourcePath: opened.targetRealPath,
+          sha256: file.sha256,
+          name: file.name,
+          mimeType: file.mimeType,
+        });
+        if (!thumbnail)
+          throw new ShareError(415, 'This file does not support a server thumbnail');
+        return { thumbnail, sha256: file.sha256 };
+      } catch (error) {
+        if (error instanceof ShareError) throw error;
+        logForRequest(req).warn({ event: 'public_thumbnail_generation_failed', shareId: share.id, fileId: file.id, err: error }, 'Public server thumbnail generation failed');
+        throw new ShareError(422, 'A thumbnail could not be generated for this file');
+      } finally {
+        await opened.fileHandle.close().catch(() => undefined);
+      }
+    });
+    setPublicResponseHeaders(res);
+    await sendThumbnail(req, res, generated.thumbnail, generated.sha256);
+  });
+  router.route('/api/public/shares/:token/files/:fileId/thumbnail')
+    .head(publicThumbnailHandler)
+    .get(publicThumbnailHandler);
 
   router.get('/api/public/shares/:token/files/:fileId/text', asyncHandler(async (req, res) => {
     if (req.query.encoding !== undefined && typeof req.query.encoding !== 'string')

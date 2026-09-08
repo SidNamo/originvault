@@ -86,9 +86,13 @@ docker compose logs -f backend
 
 | 경로 | 내용 | 백업 방식 |
 | --- | --- | --- |
-| `data/files/` | 원본 파일 바이트 | filesystem snapshot, `rsync` 등 |
+| `data/files/<storage-key>/` | 사용자별 원본 파일 바이트 | filesystem snapshot, `rsync` 등 |
+| `data/files/.originvault-thumbnails/` | SHA-256별 재생성 가능한 이미지·PDF 썸네일 | 백업 선택 사항 |
 | `data/postgresql/` | PostgreSQL 물리 데이터 | 실행 중에는 복사하지 않고 `pg_dump` 사용 |
 | `data/logs/` | 일별 JSON 로그 | 운영 보관 정책에 따라 선택 |
+
+썸네일 캐시는 서버 시작 시와 6시간마다 정리합니다. 어떤 활성·휴지통 파일에서도
+참조하지 않고 마지막 생성·재사용 후 24시간이 지난 캐시만 삭제합니다.
 
 backend는 PostgreSQL advisory lock과 파일 변경 저널로 DB 색인과 파일 작업을 일관되게
 처리합니다. 같은 PostgreSQL 및 `data/` 경로에 backend를 두 개 이상 실행하지 않습니다.

@@ -819,7 +819,7 @@ export function PreviewViewer({
                   className="preview-pdf"
                   src={preview.file.streamUrl}
                   title={`${preview.file.name} PDF 미리보기`}
-                  sandbox="allow-downloads"
+                  referrerPolicy="no-referrer"
                 />
                 <button
                   className="secondary compact pdf-fallback"

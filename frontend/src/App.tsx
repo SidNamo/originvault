@@ -2734,6 +2734,8 @@ function Dashboard({
                 ? "image"
                 : item.mimeType.startsWith("video/")
                   ? "video"
+                  : item.mimeType === "application/pdf" || /\.pdf$/i.test(item.name)
+                    ? "pdf"
                   : "unsupported"
             }
             source="files"

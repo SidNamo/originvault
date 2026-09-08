@@ -651,6 +651,8 @@ export const api = {
     `${API_URL}/public/shares/${encodeURIComponent(token)}/files/${encodeURIComponent(fileId)}/download`,
   publicSharePreviewUrl: (token: string, fileId: string) =>
     `${API_URL}/public/shares/${encodeURIComponent(token)}/files/${encodeURIComponent(fileId)}/preview`,
+  publicShareThumbnailUrl: (token: string, fileId: string) =>
+    `${API_URL}/public/shares/${encodeURIComponent(token)}/files/${encodeURIComponent(fileId)}/thumbnail`,
   publicShareFile: (token: string, fileId: string) =>
     publicRequest<PublicShareFile>(
       `/public/shares/${encodeURIComponent(token)}/files/${encodeURIComponent(fileId)}/details`,

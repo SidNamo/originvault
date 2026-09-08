@@ -459,6 +459,9 @@ export function usePausableImage({
     imageCacheResetListeners.add(reset);
     return () => {
       imageCacheResetListeners.delete(reset);
+      const current = sourceRef.current;
+      if (current?.owned) URL.revokeObjectURL(current.url);
+      sourceRef.current = undefined;
     };
   }, []);
 
@@ -476,8 +479,27 @@ export function usePausableImage({
       setSource(next);
     };
 
-    if (!active || !enabled) {
+    if (!enabled) {
       replaceSource();
+      return;
+    }
+    if (!active) {
+      const download = imageDownloads.get(resourceKey);
+      if (download?.blob) {
+        const current = sourceRef.current;
+        if (
+          current?.key !== resourceKey ||
+          current.blob !== download.blob
+        )
+          replaceSource({
+            key: resourceKey,
+            url: URL.createObjectURL(download.blob),
+            blob: download.blob,
+            owned: true,
+          });
+      } else {
+        replaceSource();
+      }
       return;
     }
 
@@ -538,7 +560,7 @@ export function usePausableImage({
     return () => {
       disposed = true;
       download.subscribers.delete(refresh);
-      replaceSource();
+      if (!download.blob) replaceSource();
       if (!download.subscribers.size) {
         download.transfer?.controller.abort();
         if (download.retryTimer !== undefined) {
@@ -553,8 +575,7 @@ export function usePausableImage({
     };
   }, [active, cacheEpoch, enabled, resourceKey, url]);
 
-  return active &&
-    enabled &&
+  return enabled &&
     source?.key === resourceKey &&
     (source.owned || source.url === url)
     ? source.url
