@@ -45,4 +45,17 @@ test('hidden markers and embedded creation dates are recognized', async () => {
     '2025-07-22T07:25:53.000Z',
   );
   assert.equal(originalCreatedAtFromMetadata({ 'PDF:CreateDate': 'not a date' }), undefined);
+  assert.equal(originalCreatedAtFromMetadata({
+    'ExifIFD:DateTimeOriginal': '2020:01:02 03:04:05',
+    'ExifIFD:OffsetTimeOriginal': '+09:00',
+  })?.toISOString(), '2020-01-01T18:04:05.000Z');
+  assert.equal(originalCreatedAtFromMetadata({
+    'EXIF:DateTimeOriginal': '0000:00:00 00:00:00',
+    'PDF:CreateDate': '2024:02:29 03:04:05Z',
+  })?.toISOString(), '2024-02-29T03:04:05.000Z');
+  assert.equal(originalCreatedAtFromMetadata({ 'ExifIFD:DateTimeOriginal': '2023:02:29 10:00:00' }), undefined);
+  assert.equal(originalCreatedAtFromMetadata({ 'System:FileCreateDate': '2026:01:01 00:00:00' }), undefined);
+  assert.equal(originalCreatedAtFromMetadata({
+    'QuickTime:CreateDate': '0000:00:00 00:00:00', 'Track2:MediaCreateDate': '2020:03:04 12:00:00',
+  })?.toISOString(), '2020-03-04T12:00:00.000Z');
 });

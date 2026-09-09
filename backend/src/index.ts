@@ -25,6 +25,7 @@ import { createRateLimiter } from './rateLimit.js';
 import { migrateLegacyTrashStorage, purgeExpiredTrash, TrashError, trashRouter, trashSelections } from './trash.js';
 import { prepareFileThumbnail, pruneUnusedThumbnails } from './thumbnails.js';
 import { backfillMissingThumbnails, type ThumbnailBackfillFile } from './thumbnailMaintenance.js';
+import { backfillOriginalCreationTimes } from './metadataMaintenance.js';
 
 const app = express();
 const registrationRateLimit = createRateLimiter({ windowMs: 60 * 60 * 1_000, max: 5 });
@@ -86,30 +87,6 @@ app.use(filePreviewRouter);
 app.use(trashRouter);
 app.use('/api/bulk', bulkOperationsRouter);
 app.use(resumableUploadRouter);
-
-async function backfillOriginalCreationTimes(): Promise<void> {
-  const rows = await db.query<{ id: string; storedName: string; metadata: Record<string, unknown> }>(`
-    SELECT id,stored_name AS "storedName",extracted_metadata AS metadata FROM files
-    WHERE (original_created_at IS NULL
-      AND extracted_metadata ?| ARRAY['EXIF:DateTimeOriginal','XMP-exif:DateTimeOriginal','QuickTime:CreateDate','PDF:CreateDate','XMP:CreateDate','XMP-xmp:CreateDate','File:FileCreateDate'])
-      OR (NOT is_hidden AND (
-        stored_name LIKE '.%'
-        OR extracted_metadata::text ILIKE '%hidden%'
-        OR extracted_metadata::text ILIKE '%fileattributes%'
-        OR extracted_metadata::text ILIKE '%dosattrib%'
-      ))
-    LIMIT 10000
-  `);
-  for (const file of rows.rows) {
-    const originalCreatedAt = originalCreatedAtFromMetadata(file.metadata);
-    const isHidden = isHiddenResource(file.storedName, file.metadata);
-    if (originalCreatedAt || isHidden)
-      await db.query(`UPDATE files
-        SET original_created_at=COALESCE(original_created_at,$1),is_hidden=is_hidden OR $2
-        WHERE id=$3`, [originalCreatedAt ?? null, isHidden, file.id]);
-  }
-  await db.query("UPDATE folders SET is_hidden=true WHERE NOT is_hidden AND name LIKE '.%'");
-}
 
 async function ensureFolderPath(user: SessionUser, baseFolderId: string | null, requestedDirectory: string, queryable: Pool | PoolClient = db): Promise<{ folderId: string | null; relativePath: string }> {
   let parentId = baseFolderId;

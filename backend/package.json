@@ -7,7 +7,8 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "test": "node --import tsx --import ./tests/setup.ts --test tests/*.test.ts"
+    "test": "node --import tsx --import ./tests/setup.ts --test tests/*.test.ts",
+    "test:integration": "node --import tsx --import ./tests/setup.ts --test tests/webdav.integration.test.ts"
   },
   "dependencies": {
     "archiver": "^8.0.0",
@@ -19,6 +20,7 @@
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.16.3",
     "pino": "^10.3.1",
+    "saxes": "^6.0.0",
     "sharp": "^0.35.4"
   },
   "devDependencies": {

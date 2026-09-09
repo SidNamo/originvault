@@ -21,8 +21,11 @@ import type { Request, Response } from 'express';
 import sharp from 'sharp';
 import { config } from './config.js';
 import { logger } from './logger.js';
+import { ThumbnailRenderQueue, ThumbnailRendererBusyError, type ThumbnailRenderJob } from './thumbnailRenderQueue.js';
 
-export type ThumbnailKind = 'image' | 'pdf';
+export { ThumbnailRendererBusyError } from './thumbnailRenderQueue.js';
+
+export type ThumbnailKind = 'image' | 'pdf' | 'video';
 type ImageDerivative = 'thumbnail' | 'preview';
 
 export type CachedThumbnail = {
@@ -36,8 +39,10 @@ const IMAGE_PREVIEW_EDGE = 2560;
 const MAX_IMAGE_PIXELS = 100_000_000;
 const MAX_PDF_RENDER_BYTES = 16 * 1024 * 1024;
 const MAX_IMAGE_RENDER_BYTES = 64 * 1024 * 1024;
+const MAX_VIDEO_RENDER_BYTES = 16 * 1024 * 1024;
 const PDF_RENDER_TIMEOUT_MS = 30_000;
 const IMAGE_RENDER_TIMEOUT_MS = 35_000;
+const VIDEO_RENDER_TIMEOUT_MS = 35_000;
 const MAX_RENDERER_ERROR_BYTES = 64 * 1024;
 const UNUSED_THUMBNAIL_GRACE_MS = 24 * 60 * 60 * 1_000;
 const MAX_CONCURRENT_DERIVATIVE_RENDERS = 2;
@@ -119,9 +124,38 @@ const BROWSER_IMAGE_MIMES = new Set([
   'image/jpeg', 'image/pjpeg', 'image/png', 'image/apng', 'image/gif', 'image/webp', 'image/avif',
   'image/bmp', 'image/x-icon', 'image/vnd.microsoft.icon', 'image/svg+xml',
 ]);
-const pendingThumbnails = new Map<string, Promise<CachedThumbnail>>();
-const derivativeRenderWaiters: Array<(release: () => void) => void> = [];
-let activeDerivativeRenders = 0;
+const VIDEO_DEMUXERS_BY_EXTENSION: Readonly<Record<string, string>> = {
+  mp4: 'mov', m4v: 'mov', mov: 'mov', qt: 'mov', '3gp': 'mov', '3g2': 'mov', f4v: 'mov',
+  mkv: 'matroska', webm: 'matroska',
+  avi: 'avi', divx: 'avi',
+  wmv: 'asf', asf: 'asf',
+  flv: 'flv',
+  m2ts: 'mpegts', mts: 'mpegts',
+  mpg: 'mpeg', mpeg: 'mpeg', mpe: 'mpeg', m2v: 'mpegvideo', vob: 'mpeg',
+  ogv: 'ogg',
+  rm: 'rm', rmvb: 'rm',
+  mxf: 'mxf', nut: 'nut', dv: 'dv',
+};
+const VIDEO_DEMUXERS_BY_MIME: Readonly<Record<string, string>> = {
+  'video/mp4': 'mov',
+  'video/quicktime': 'mov',
+  'video/3gpp': 'mov',
+  'video/3gpp2': 'mov',
+  'video/x-m4v': 'mov',
+  'video/x-matroska': 'matroska',
+  'video/webm': 'matroska',
+  'video/x-msvideo': 'avi',
+  'video/x-ms-wmv': 'asf',
+  'video/x-ms-asf': 'asf',
+  'video/x-flv': 'flv',
+  'video/mp2t': 'mpegts',
+  'video/mpeg': 'mpeg',
+  'video/ogg': 'ogg',
+  'application/mxf': 'mxf',
+};
+const VIDEO_FORMAT_WHITELIST = 'mov,matroska,webm,avi,asf,flv,mpegts,mpeg,mpegvideo,ogg,rm,mxf,nut,dv';
+const pendingThumbnails = new Map<string, { promise: Promise<CachedThumbnail>; job: ThumbnailRenderJob }>();
+const derivativeRenderQueue = new ThumbnailRenderQueue(MAX_CONCURRENT_DERIVATIVE_RENDERS, MAX_QUEUED_DERIVATIVE_RENDERS);
 
 export class ThumbnailGenerationError extends Error {
   readonly code?: string;
@@ -132,38 +166,6 @@ export class ThumbnailGenerationError extends Error {
       && 'code' in options.cause && typeof options.cause.code === 'string'
       ? options.cause.code
       : undefined);
-  }
-}
-
-export class ThumbnailRendererBusyError extends ThumbnailGenerationError {}
-
-function derivativeRenderRelease(): () => void {
-  let released = false;
-  return () => {
-    if (released) return;
-    released = true;
-    const next = derivativeRenderWaiters.shift();
-    if (next) next(derivativeRenderRelease());
-    else activeDerivativeRenders -= 1;
-  };
-}
-
-async function acquireDerivativeRenderSlot(): Promise<() => void> {
-  if (activeDerivativeRenders < MAX_CONCURRENT_DERIVATIVE_RENDERS) {
-    activeDerivativeRenders += 1;
-    return derivativeRenderRelease();
-  }
-  if (derivativeRenderWaiters.length >= MAX_QUEUED_DERIVATIVE_RENDERS)
-    throw new ThumbnailRendererBusyError('Thumbnail renderer is busy');
-  return new Promise((resolve) => derivativeRenderWaiters.push(resolve));
-}
-
-async function withDerivativeRenderSlot<T>(work: () => Promise<T>): Promise<T> {
-  const release = await acquireDerivativeRenderSlot();
-  try {
-    return await work();
-  } finally {
-    release();
   }
 }
 
@@ -185,11 +187,19 @@ function magickCoder(name: string, mimeType = ''): string | undefined {
     ?? MAGICK_CODERS_BY_MIME[normalizedMime(mimeType)];
 }
 
+function videoDemuxer(name: string, mimeType = ''): string | undefined {
+  const extension = imageExtension(name);
+  if ((extension === 'ts' || extension === 'mts') && normalizedMime(mimeType) !== 'video/mp2t') return undefined;
+  return VIDEO_DEMUXERS_BY_EXTENSION[extension]
+    ?? VIDEO_DEMUXERS_BY_MIME[normalizedMime(mimeType)];
+}
+
 export function thumbnailKind(name: string, mimeType = ''): ThumbnailKind | undefined {
   const extension = imageExtension(name);
   const mime = normalizedMime(mimeType);
   if (isSvg(name, mimeType)) return undefined;
   if (IMAGE_EXTENSIONS.has(extension) || MAGICK_CODERS_BY_MIME[mime] || mime.startsWith('image/')) return 'image';
+  if (videoDemuxer(name, mimeType) || mime.startsWith('video/')) return 'video';
   if (extension === 'pdf' || mime === 'application/pdf') return 'pdf';
   return undefined;
 }
@@ -219,11 +229,15 @@ function derivativeTarget(
   if (!/^[a-f\d]{64}$/i.test(sha256)) throw new ThumbnailGenerationError('Invalid thumbnail content hash');
   if (derivative === 'preview' && kind !== 'image')
     throw new ThumbnailGenerationError('Only images support generated detail previews');
-  const extension = kind === 'pdf' ? 'jpg' : 'webp';
-  const suffix = derivative === 'preview' ? `.preview.${extension}` : `.${extension}`;
+  const extension = kind === 'image' ? 'webp' : 'jpg';
+  const suffix = derivative === 'preview'
+    ? `.preview.${extension}`
+    : kind === 'video'
+      ? `.video.${extension}`
+      : `.${extension}`;
   return {
     path: path.join(thumbnailRoot(), sha256.slice(0, 2).toLowerCase(), `${sha256.toLowerCase()}${suffix}`),
-    contentType: kind === 'pdf' ? 'image/jpeg' : 'image/webp',
+    contentType: kind === 'image' ? 'image/webp' : 'image/jpeg',
   };
 }
 
@@ -266,18 +280,22 @@ async function renderStreamedProcess(options: {
   maximumOutputBytes?: number;
   env?: NodeJS.ProcessEnv;
   cwd?: string;
+  sourceMode?: 'pipe' | 'descriptor';
 }): Promise<void> {
+  const sourceMode = options.sourceMode ?? 'pipe';
   const child = spawn(options.command, options.args, {
     cwd: options.cwd,
     env: options.env,
-    stdio: ['pipe', 'pipe', 'pipe'],
+    stdio: sourceMode === 'descriptor'
+      ? [options.sourceHandle.fd, 'pipe', 'pipe']
+      : ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
   });
   let rendererError = '';
   let rendererErrorBytes = 0;
   let rendererErrorTruncated = false;
   let timedOut = false;
-  child.stderr.on('data', (chunk: Buffer) => {
+  child.stderr!.on('data', (chunk: Buffer) => {
     rendererErrorBytes += chunk.length;
     const capturedBytes = Buffer.byteLength(rendererError);
     if (capturedBytes < MAX_RENDERER_ERROR_BYTES) {
@@ -295,13 +313,15 @@ async function renderStreamedProcess(options: {
     child.kill('SIGKILL');
   }, options.timeoutMs);
   timeout.unref();
-  const input = pipeline(
-    options.sourceHandle.createReadStream({ start: 0, autoClose: false }),
-    child.stdin,
-  ).catch((error) => {
-    if (!isExpectedPipeClosure(error)) child.kill('SIGKILL');
-    throw error;
-  });
+  const input = sourceMode === 'descriptor'
+    ? Promise.resolve()
+    : pipeline(
+        options.sourceHandle.createReadStream({ start: 0, autoClose: false }),
+        child.stdin!,
+      ).catch((error) => {
+        if (!isExpectedPipeClosure(error)) child.kill('SIGKILL');
+        throw error;
+      });
   let outputBytes = 0;
   const outputLimit = options.maximumOutputBytes === undefined
     ? undefined
@@ -316,8 +336,8 @@ async function renderStreamedProcess(options: {
         },
       });
   const output = (outputLimit
-    ? pipeline(child.stdout, outputLimit, createWriteStream(options.targetPath, { flags: 'wx', mode: 0o600 }))
-    : pipeline(child.stdout, createWriteStream(options.targetPath, { flags: 'wx', mode: 0o600 })))
+    ? pipeline(child.stdout!, outputLimit, createWriteStream(options.targetPath, { flags: 'wx', mode: 0o600 }))
+    : pipeline(child.stdout!, createWriteStream(options.targetPath, { flags: 'wx', mode: 0o600 })))
     .catch((error) => {
       child.kill('SIGKILL');
       throw error;
@@ -358,6 +378,54 @@ function renderPdfFirstPage(sourceHandle: FileHandle, targetPath: string): Promi
     timeoutMs: PDF_RENDER_TIMEOUT_MS,
     errorLabel: 'PDF renderer',
     maximumOutputBytes: MAX_PDF_RENDER_BYTES,
+    env: rendererEnvironment(),
+    cwd: '/tmp',
+  });
+}
+
+function renderVideoThumbnail(
+  sourceHandle: FileHandle,
+  targetPath: string,
+  name: string,
+  mimeType = '',
+): Promise<void> {
+  const demuxer = videoDemuxer(name, mimeType);
+  return renderStreamedProcess({
+    command: 'ffmpeg',
+    args: [
+      '-hide_banner',
+      '-loglevel', 'error',
+      '-nostdin',
+      '-max_alloc', '268435456',
+      '-threads', '2',
+      '-filter_threads', '1',
+      '-protocol_whitelist', 'file,pipe',
+      '-format_whitelist', VIDEO_FORMAT_WHITELIST,
+      '-probesize', '20971520',
+      '-analyzeduration', '10000000',
+      ...(demuxer ? ['-f', demuxer] : []),
+      '-i', '/proc/self/fd/0',
+      '-map', '0:v:0',
+      '-an',
+      '-sn',
+      '-dn',
+      '-frames:v', '1',
+      '-vf', "scale=w='max(2,trunc(min(512,min(iw*sar,512*dar))/2)*2)':h='max(2,trunc(min(512,min(ih,512/dar))/2)*2)':flags=lanczos,setsar=1,thumbnail=24",
+      '-map_metadata', '-1',
+      '-map_chapters', '-1',
+      '-pix_fmt', 'yuvj420p',
+      '-c:v', 'mjpeg',
+      '-threads', '1',
+      '-q:v', '3',
+      '-f', 'image2pipe',
+      'pipe:1',
+    ],
+    sourceHandle,
+    sourceMode: 'descriptor',
+    targetPath,
+    timeoutMs: VIDEO_RENDER_TIMEOUT_MS,
+    errorLabel: 'Video thumbnail renderer',
+    maximumOutputBytes: MAX_VIDEO_RENDER_BYTES,
     env: rendererEnvironment(),
     cwd: '/tmp',
   });
@@ -443,6 +511,7 @@ type DerivativeInput = {
   sourcePath: string;
   sourceHandle?: FileHandle;
   verifySourceHash?: boolean;
+  priority?: ThumbnailRenderJob['priority'];
   sha256: string;
   name: string;
   mimeType?: string;
@@ -460,12 +529,13 @@ async function createDerivative(
   target: CachedThumbnail,
   kind: ThumbnailKind,
   derivative: ImageDerivative,
+  job: ThumbnailRenderJob,
 ): Promise<CachedThumbnail> {
   await mkdir(path.dirname(target.path), { recursive: true, mode: 0o700 });
   const temporaryPath = `${target.path}.${process.pid}-${randomUUID()}.tmp`;
   let openedSource: FileHandle | undefined;
   try {
-    return await withDerivativeRenderSlot(async () => {
+    return await derivativeRenderQueue.run(job, async () => {
       const sourceHandle = input.sourceHandle
         ?? await open(input.sourcePath, constants.O_RDONLY | constants.O_NOFOLLOW);
       if (!input.sourceHandle) openedSource = sourceHandle;
@@ -476,6 +546,8 @@ async function createDerivative(
         throw new ThumbnailGenerationError('Thumbnail source does not match its indexed hash', { code: 'ESTALE' });
       if (kind === 'pdf') {
         await renderPdfFirstPage(sourceHandle, temporaryPath);
+      } else if (kind === 'video') {
+        await renderVideoThumbnail(sourceHandle, temporaryPath, input.name, input.mimeType);
       } else {
         const edge = derivative === 'preview' ? IMAGE_PREVIEW_EDGE : THUMBNAIL_EDGE;
         const quality = derivative === 'preview' ? 88 : 82;
@@ -491,7 +563,7 @@ async function createDerivative(
     });
   } catch (error) {
     await rm(temporaryPath, { force: true }).catch(() => undefined);
-    if (error instanceof ThumbnailGenerationError) throw error;
+    if (error instanceof ThumbnailGenerationError || error instanceof ThumbnailRendererBusyError) throw error;
     throw new ThumbnailGenerationError(
       error instanceof Error ? error.message : 'Thumbnail generation failed',
       { cause: error },
@@ -514,12 +586,17 @@ async function getOrCreateDerivative(
   }
   const key = `${derivative}:${kind}:${input.sha256.toLowerCase()}`;
   const pending = pendingThumbnails.get(key);
-  if (pending) return pending;
-  const creation = createDerivative(input, target, kind, derivative)
+  const priority = input.priority ?? 'interactive';
+  if (pending) {
+    if (priority === 'interactive') pending.job.priority = priority;
+    return pending.promise;
+  }
+  const job: ThumbnailRenderJob = { priority };
+  const creation = createDerivative(input, target, kind, derivative, job)
     .finally(() => {
-      if (pendingThumbnails.get(key) === creation) pendingThumbnails.delete(key);
+      if (pendingThumbnails.get(key)?.promise === creation) pendingThumbnails.delete(key);
     });
-  pendingThumbnails.set(key, creation);
+  pendingThumbnails.set(key, { promise: creation, job });
   return creation;
 }
 
@@ -542,7 +619,7 @@ export async function getOrCreateImagePreview(input: DerivativeInput): Promise<C
 export async function prepareFileThumbnail(input: DerivativeInput): Promise<void> {
   if (!thumbnailKind(input.name, input.mimeType)) return;
   try {
-    await getOrCreateThumbnail(input);
+    await getOrCreateThumbnail({ ...input, priority: 'background' });
   } catch (error) {
     logger.warn({
       event: 'thumbnail_preparation_failed',
@@ -583,7 +660,7 @@ export async function pruneUnusedThumbnails(
       const shardPath = path.join(versionPath, shard.name);
       for (const entry of await cacheDirectoryEntries(shardPath)) {
         if (!entry.isFile()) continue;
-        const match = entry.name.match(/^([a-f\d]{64})(?:\.preview)?\.(?:webp|jpg)(\.[^.]+\.tmp)?$/i);
+        const match = entry.name.match(/^([a-f\d]{64})(?:\.(?:preview|video))?\.(?:webp|jpg)(\.[^.]+\.tmp)?$/i);
         if (!match?.[1]) continue;
         scannedFiles += 1;
         const sha256 = match[1].toLowerCase();

@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { createWriteStream } from 'node:fs';
+import { constants, createWriteStream } from 'node:fs';
 import { link, mkdir, open, rename, rm, stat, utimes } from 'node:fs/promises';
 import path from 'node:path';
 import { Transform } from 'node:stream';
@@ -24,6 +24,9 @@ import { extractMetadata, isHiddenResource, originalCreatedAtFromMetadata, resol
 import { prepareFileThumbnail } from './thumbnails.js';
 import { pruneEmptyActiveFolders, removeEmptyActiveFolderPaths } from './folderCleanup.js';
 import { moveSelectionsToTrash } from './trash.js';
+import { parseWebdavDateProperties, parseWebdavMtime, type WebdavDateProperty } from './webdavProperties.js';
+
+export { parseWebdavMtime } from './webdavProperties.js';
 
 class DavError extends Error {
   constructor(readonly statusCode: number, message: string) { super(message); }
@@ -51,6 +54,7 @@ interface DavResource {
   mimeType?: string;
   sizeBytes?: string;
   sha256?: string;
+  metadata?: Record<string, unknown>;
   createdAt: Date | string;
   modifiedAt: Date | string;
 }
@@ -62,20 +66,6 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3
 const TOKEN_PATTERN = /^ovd_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})_([A-Za-z0-9_-]{32,})$/i;
 const WEBDAV_MTIME_HEADERS = ['x-oc-mtime', 'x-upload-mtime', 'x-file-mtime', 'x-last-modified', 'last-modified'] as const;
 const MIME_TYPE_PATTERN = /^[\w!#$&^_.+-]+\/[\w!#$&^_.+-]+$/;
-
-export function parseWebdavMtime(value: string | undefined): Date | null {
-  const normalized = value?.trim();
-  if (!normalized) return null;
-  let milliseconds: number;
-  if (/^-?\d+(?:\.\d+)?$/.test(normalized)) {
-    const numeric = Number(normalized);
-    if (!Number.isFinite(numeric)) return null;
-    milliseconds = Math.abs(numeric) < 100_000_000_000 ? numeric * 1000 : numeric;
-  } else milliseconds = Date.parse(normalized);
-  if (!Number.isFinite(milliseconds) || Math.abs(milliseconds) > 8_640_000_000_000_000) return null;
-  const parsed = new Date(milliseconds);
-  return Number.isFinite(parsed.getTime()) ? parsed : null;
-}
 
 function requestClientModifiedTime(req: Request): { value: Date; headerName: string } | null {
   for (const headerName of WEBDAV_MTIME_HEADERS) {
@@ -97,10 +87,8 @@ function normalizedMimeType(value: unknown): string | null {
 export function webdavContentType(requested: string | undefined, metadata: Record<string, unknown>): string {
   const requestedMimeType = normalizedMimeType(requested);
   const extractedMimeType = normalizedMimeType(metadata['File:MIMEType']);
-  if (!requestedMimeType || requestedMimeType === 'application/octet-stream') {
-    return extractedMimeType ?? requestedMimeType ?? 'application/octet-stream';
-  }
-  return requestedMimeType;
+  if (extractedMimeType && extractedMimeType !== 'application/octet-stream') return extractedMimeType;
+  return requestedMimeType ?? extractedMimeType ?? 'application/octet-stream';
 }
 
 export function webdavQuota(usage: Pick<StorageUsage, 'usedBytes' | 'reservedBytes' | 'quotaBytes'>): { usedBytes: string; availableBytes: string } | null {
@@ -122,25 +110,6 @@ async function syncRenameDirectories(sourcePath: string, targetPath: string): Pr
     const targetHandle = await open(targetDirectory, 'r');
     try { await targetHandle.sync(); } finally { await targetHandle.close(); }
   }
-}
-
-async function movedFolderMtimes(
-  root: string,
-  sourceRelativePath: string,
-  targetRelativePath: string,
-  files: Array<{ relativePath: string }>,
-): Promise<Date[]> {
-  const mtimes: Date[] = [];
-  for (let index = 0; index < files.length; index += 32) {
-    const batch = await Promise.all(files.slice(index, index + 32).map(async (file) => {
-      const movedRelativePath = targetRelativePath + file.relativePath.slice(sourceRelativePath.length);
-      const fileStat = await stat(resolveInside(root, movedRelativePath));
-      if (!fileStat.isFile()) throw new DavError(409, 'Moved file is not a regular file');
-      return fileStat.mtime;
-    }));
-    mtimes.push(...batch);
-  }
-  return mtimes;
 }
 
 function hashToken(token: string): string {
@@ -209,22 +178,24 @@ function relativePath(identity: DavIdentity, segments: string[]): string {
   return [identity.scopePath, ...segments].filter(Boolean).join('/');
 }
 
-async function resourceAt(identity: DavIdentity, segments: string[], queryable: Queryable = db): Promise<DavResource | null> {
+async function resourceAt(identity: DavIdentity, segments: string[], queryable: Queryable = db, includeMetadata = false): Promise<DavResource | null> {
   const requestedPath = relativePath(identity, segments);
-  if (!segments.length) {
+  if (!segments.length && !identity.folderId) {
     return {
       type: 'folder', id: identity.folderId, folderId: identity.folderId, name: identity.scopeName,
       relativePath: identity.scopePath, createdAt: new Date(0), modifiedAt: new Date(),
     };
   }
   const folder = await queryable.query(`
-    SELECT id,parent_id AS "parentId",name,relative_path AS "relativePath",created_at AS "createdAt",modified_at AS "modifiedAt"
+    SELECT id,parent_id AS "parentId",name,relative_path AS "relativePath",
+      COALESCE(original_created_at,created_at) AS "createdAt",COALESCE(original_modified_at,modified_at) AS "modifiedAt"
     FROM folders WHERE user_id=$1 AND relative_path=$2 AND trashed_at IS NULL
   `, [identity.userId, requestedPath]);
   if (folder.rowCount) return { type: 'folder', folderId: folder.rows[0].id, ...folder.rows[0] } as DavResource;
   const file = await queryable.query(`
     SELECT id,folder_id AS "folderId",stored_name AS name,relative_path AS "relativePath",mime_type AS "mimeType",
-      size_bytes::text AS "sizeBytes",sha256,created_at AS "createdAt",COALESCE(client_last_modified,modified_at) AS "modifiedAt"
+      size_bytes::text AS "sizeBytes",sha256,COALESCE(original_created_at,created_at) AS "createdAt",
+      COALESCE(client_last_modified,modified_at) AS "modifiedAt"${includeMetadata ? ',extracted_metadata AS metadata' : ''}
     FROM files WHERE user_id=$1 AND relative_path=$2 AND trashed_at IS NULL ORDER BY created_at LIMIT 1
   `, [identity.userId, requestedPath]);
   return file.rows[0] ? { type: 'file', ...file.rows[0] } as DavResource : null;
@@ -276,14 +247,115 @@ async function handlePropfind(req: Request, res: Response, identity: DavIdentity
   const responses = [propertyResponse(resource, segments, quota)];
   if (depth === '1' && resource.type === 'folder') {
     const [folders, files] = await Promise.all([
-      db.query(`SELECT id,name,relative_path AS "relativePath",created_at AS "createdAt",modified_at AS "modifiedAt" FROM folders WHERE user_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND trashed_at IS NULL ORDER BY name`, [identity.userId, resource.folderId]),
-      db.query(`SELECT id,folder_id AS "folderId",stored_name AS name,relative_path AS "relativePath",mime_type AS "mimeType",size_bytes::text AS "sizeBytes",sha256,created_at AS "createdAt",COALESCE(client_last_modified,modified_at) AS "modifiedAt" FROM files WHERE user_id=$1 AND folder_id IS NOT DISTINCT FROM $2 AND trashed_at IS NULL ORDER BY stored_name`, [identity.userId, resource.folderId]),
+      db.query(`SELECT id,name,relative_path AS "relativePath",COALESCE(original_created_at,created_at) AS "createdAt",COALESCE(original_modified_at,modified_at) AS "modifiedAt" FROM folders WHERE user_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND trashed_at IS NULL ORDER BY name`, [identity.userId, resource.folderId]),
+      db.query(`SELECT id,folder_id AS "folderId",stored_name AS name,relative_path AS "relativePath",mime_type AS "mimeType",size_bytes::text AS "sizeBytes",sha256,COALESCE(original_created_at,created_at) AS "createdAt",COALESCE(client_last_modified,modified_at) AS "modifiedAt" FROM files WHERE user_id=$1 AND folder_id IS NOT DISTINCT FROM $2 AND trashed_at IS NULL ORDER BY stored_name`, [identity.userId, resource.folderId]),
     ]);
     for (const folder of folders.rows) responses.push(propertyResponse({ type: 'folder', folderId: folder.id, ...folder } as DavResource, [...segments, folder.name]));
     for (const file of files.rows) responses.push(propertyResponse({ type: 'file', ...file } as DavResource, [...segments, file.name]));
   }
   req.resume();
   res.status(207).type('application/xml').send(`<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">${responses.join('')}</D:multistatus>`);
+}
+
+const propertyUpdateBody = express.text({ type: () => true, limit: '64kb' });
+
+function sendPropertyUpdate(res: Response, segments: string[], collection: boolean, properties: WebdavDateProperty[]): void {
+  const reasons = { 200: 'OK', 403: 'Forbidden', 409: 'Conflict', 424: 'Failed Dependency' };
+  const stats = properties.map((property) => `<D:propstat><D:prop>`
+    + (property.namespace ? `<P:${property.name} xmlns:P="${xml(property.namespace)}"/>` : `<${property.name}/>`)
+    + `</D:prop><D:status>HTTP/1.1 ${property.status} ${reasons[property.status]}</D:status></D:propstat>`);
+  res.status(207).type('application/xml').send(`<?xml version="1.0" encoding="utf-8"?>`
+    + `<D:multistatus xmlns:D="DAV:"><D:response><D:href>${xml(webdavHref(segments, collection))}</D:href>`
+    + `${stats.join('')}</D:response></D:multistatus>`);
+}
+
+async function handleProppatch(req: Request, res: Response, identity: DavIdentity, segments: string[]): Promise<void> {
+  ensureWritable(identity);
+  await new Promise<void>((resolve, reject) => propertyUpdateBody(req, res, (error) => {
+    if (error) reject(new DavError(error.status === 413 ? 413 : 400, 'Invalid WebDAV property update body'));
+    else resolve();
+  }));
+  let properties: WebdavDateProperty[];
+  try {
+    properties = parseWebdavDateProperties(typeof req.body === 'string' ? req.body : '');
+  } catch (error) {
+    throw new DavError(400, error instanceof Error ? error.message : 'Invalid WebDAV date properties');
+  }
+  const client = await db.connect();
+  const lockKey = `originvault:${identity.userId}`;
+  let lockHeld = false;
+  let fileHandle: Awaited<ReturnType<typeof open>> | undefined;
+  let resource: DavResource;
+  try {
+    await client.query('SELECT pg_advisory_lock(hashtext($1))', [lockKey]);
+    lockHeld = true;
+    await client.query('BEGIN');
+    const token = await client.query(`
+      SELECT COALESCE(f.relative_path,'') AS "scopePath"
+      FROM webdav_tokens t JOIN users u ON u.id=t.user_id AND u.disabled_at IS NULL
+      LEFT JOIN folders f ON f.id=t.folder_id AND f.user_id=t.user_id AND f.trashed_at IS NULL
+      WHERE t.id=$1 AND t.user_id=$2 AND t.access='readwrite' AND t.revoked_at IS NULL
+        AND (t.expires_at IS NULL OR t.expires_at>now()) AND (t.folder_id IS NULL OR f.id IS NOT NULL)
+    `, [identity.tokenId, identity.userId]);
+    if (!token.rowCount || token.rows[0].scopePath !== identity.scopePath)
+      throw new DavError(403, 'WebDAV write scope is no longer available');
+    const current = await resourceAt(identity, segments, client, true);
+    if (!current) throw new DavError(404, 'Resource not found');
+    resource = current;
+    if (!resource.id) for (const property of properties) property.status = 403;
+    if (properties.some((property) => property.status !== 200)) {
+      await client.query('COMMIT');
+      sendPropertyUpdate(res, segments, resource.type === 'folder', properties);
+      return;
+    }
+    const created = properties.find((property) => property.kind === 'created')?.value;
+    const modified = properties.find((property) => property.kind === 'modified')?.value;
+    fileHandle = await open(resolveInside(userFilesRoot(identity.storageKey), resource.relativePath), constants.O_RDONLY | constants.O_NOFOLLOW);
+    const details = await fileHandle.stat();
+    if (resource.type === 'file' ? !details.isFile() || BigInt(details.size) !== BigInt(resource.sizeBytes!) : !details.isDirectory())
+      throw new DavError(409, 'Stored resource is inconsistent');
+    if (resource.type === 'file') {
+      const metadata = { ...resource.metadata };
+      if (created) metadata['WebDAV:CreationDate'] = created.toISOString();
+      if (modified) metadata['WebDAV:LastModified'] = modified.toISOString();
+      // A client filesystem creation date must not replace an embedded capture date.
+      const originalCreated = originalCreatedAtFromMetadata(metadata) ?? created;
+      await client.query(`
+        UPDATE files SET client_last_modified=COALESCE($1,client_last_modified),
+          original_created_at=COALESCE($2,original_created_at),extracted_metadata=$3,modified_at=now()
+        WHERE id=$4 AND user_id=$5 AND trashed_at IS NULL
+      `, [modified ?? null, originalCreated ?? null, metadata, resource.id, identity.userId]);
+    } else {
+      await client.query(`
+        UPDATE folders SET original_created_at=COALESCE($1,original_created_at),
+          original_modified_at=COALESCE($2,original_modified_at),modified_at=now()
+        WHERE id=$3 AND user_id=$4 AND trashed_at IS NULL
+      `, [created ?? null, modified ?? null, resource.id, identity.userId]);
+    }
+    await client.query('COMMIT');
+    if (modified) {
+      // The DB is authoritative; retain exact client timestamps even on filesystems with coarser precision.
+      await fileHandle.utimes(details.atime, modified).catch((error) =>
+        logForRequest(req).warn({ event: 'webdav_property_mtime_not_supported', resourceId: resource.id, err: error }, 'Original modification time was indexed but could not be applied to the filesystem'));
+    }
+    logForRequest(req).info({ event: 'webdav_date_properties_updated', resourceId: resource.id, created, modified }, 'WebDAV original dates were indexed without modifying file bytes');
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
+    throw error;
+  } finally {
+    await fileHandle?.close().catch(() => undefined);
+    let releaseError: Error | undefined;
+    if (lockHeld) {
+      try {
+        const result = await client.query<{ unlocked: boolean }>('SELECT pg_advisory_unlock(hashtext($1)) AS unlocked', [lockKey]);
+        if (!result.rows[0]?.unlocked) throw new Error('User mutation lock was not held');
+      } catch (error) {
+        releaseError = error instanceof Error ? error : new Error('Could not release WebDAV date property lock');
+      }
+    }
+    client.release(releaseError);
+  }
+  sendPropertyUpdate(res, segments, resource.type === 'folder', properties);
 }
 
 async function handleGet(req: Request, res: Response, identity: DavIdentity, segments: string[]): Promise<void> {
@@ -456,14 +528,15 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
       requestedLastModified = new Date();
       await utimes(stagedPath, new Date(), requestedLastModified);
     }
-    const clientLastModified = (await stat(stagedPath)).mtime;
-    clientMtimeAccepted = Boolean(clientModifiedTime && clientLastModified.getTime() === clientModifiedTime.value.getTime());
+    const storedMtime = (await stat(stagedPath)).mtime;
+    const clientLastModified = clientModifiedTime?.value ?? null;
+    clientMtimeAccepted = Boolean(clientLastModified && storedMtime.getTime() === clientLastModified.getTime());
     if (clientModifiedTime && !clientMtimeAccepted) {
       logForRequest(req).warn({
         event: 'webdav_mtime_adjusted',
         headerName: clientModifiedTime.headerName,
         requested: clientModifiedTime.value.toISOString(),
-        stored: clientLastModified.toISOString(),
+        stored: storedMtime.toISOString(),
       }, 'Filesystem adjusted the WebDAV client modification time');
     }
     const stagedHandle = await open(stagedPath, 'r');
@@ -539,10 +612,11 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
     const stagingHandle = await open(stagingDirectory, 'r');
     try { await stagingHandle.sync(); } finally { await stagingHandle.close(); }
     const metadata = await extractMetadata(targetPath);
+    if (clientLastModified) metadata['WebDAV:LastModified'] = clientLastModified.toISOString();
     const mimeType = webdavContentType(req.header('content-type'), metadata);
     if (existing) {
       await client.query(`
-        UPDATE files SET folder_id=$1,stored_name=$2,relative_path=$3,mime_type=$4,size_bytes=$5,sha256=$6,
+        UPDATE files SET folder_id=$1,original_name=$2,stored_name=$2,relative_path=$3,mime_type=$4,size_bytes=$5,sha256=$6,
           upload_identity_hash=NULL,client_last_modified=$7,extracted_metadata=$8,is_hidden=$9,original_created_at=$10,modified_at=now(),
           text_encoding=NULL,text_has_bom=NULL
         WHERE id=$11 AND user_id=$12
@@ -568,7 +642,7 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
       sizeBytes: size.toString(),
       sha256,
       mimeType,
-      clientLastModified: clientLastModified.toISOString(),
+      clientLastModified: clientLastModified?.toISOString(),
       clientMtimeHeader: clientModifiedTime?.headerName,
       clientMtimeAccepted,
       metadataFieldCount: Object.keys(metadata).length,
@@ -750,7 +824,7 @@ async function handleMove(req: Request, res: Response, identity: DavIdentity, so
     lockHeld = true;
     await client.query('BEGIN');
     transactionStarted = true;
-    const source = await resourceAt(identity, sourceSegments, client);
+    const source = await resourceAt(identity, sourceSegments, client, true);
     if (!source) throw new DavError(404, 'Resource not found');
     if (await resourceAt(identity, targetSegments, client)) throw new DavError(412, 'Destination already exists');
     const targetParent = await parentFolder(identity, targetSegments, client);
@@ -788,18 +862,15 @@ async function handleMove(req: Request, res: Response, identity: DavIdentity, so
     await rename(sourcePath, targetPath);
     moved = true;
     await syncRenameDirectories(sourcePath, targetPath);
-    const folderFileMtimes = source.type === 'folder'
-      ? await movedFolderMtimes(root, sourceRelativePath, targetRelativePath, folderFiles)
-      : [];
     const targetName = targetSegments.at(-1)!;
     if (source.type === 'file') {
       await client.query(`
         UPDATE files SET folder_id=$1,original_name=$2,stored_name=$2,relative_path=$3,
-          client_last_modified=$4,is_hidden=$5,
+          is_hidden=$4,
           extracted_metadata=extracted_metadata - 'System:FileName' - 'System:Directory'
             - 'System:FileAccessDate' - 'System:FileInodeChangeDate',modified_at=now()
-        WHERE id=$6 AND user_id=$7
-      `, [targetParent.id, targetName, targetRelativePath, sourceFileStat!.mtime, isHiddenResource(targetName), source.id, identity.userId]);
+        WHERE id=$5 AND user_id=$6
+      `, [targetParent.id, targetName, targetRelativePath, isHiddenResource(targetName, source.metadata), source.id, identity.userId]);
     } else {
       await client.query(`
         UPDATE folders SET name=CASE WHEN id=$1 THEN $4 ELSE name END,
@@ -812,13 +883,11 @@ async function handleMove(req: Request, res: Response, identity: DavIdentity, so
         const updatedFiles = await client.query(`
           UPDATE files AS indexed SET
             relative_path=$2 || substring(indexed.relative_path FROM length($1)+1),
-            client_last_modified=moved.mtime,
             extracted_metadata=indexed.extracted_metadata - 'System:FileName' - 'System:Directory'
               - 'System:FileAccessDate' - 'System:FileInodeChangeDate',modified_at=now()
-          FROM unnest($4::uuid[],$5::timestamptz[]) AS moved(id,mtime)
-          WHERE indexed.user_id=$3 AND indexed.id=moved.id
+          WHERE indexed.user_id=$3 AND indexed.id=ANY($4::uuid[])
             AND left(indexed.relative_path,length($1)+1)=$1 || '/'
-        `, [source.relativePath, targetRelativePath, identity.userId, folderFiles.map((file) => file.id), folderFileMtimes]);
+        `, [source.relativePath, targetRelativePath, identity.userId, folderFiles.map((file) => file.id)]);
         if (updatedFiles.rowCount !== folderFiles.length) throw new DavError(409, 'Moved folder contents changed during the operation');
       }
     }
@@ -876,10 +945,11 @@ export function createWebdavRouter(): express.Router {
       const segments = strictSegments(req.path);
       res.setHeader('DAV', '1');
       res.setHeader('MS-Author-Via', 'DAV');
-      res.setHeader('Allow', 'OPTIONS, PROPFIND, GET, HEAD, PUT, MKCOL, DELETE, MOVE');
+      res.setHeader('Allow', 'OPTIONS, PROPFIND, PROPPATCH, GET, HEAD, PUT, MKCOL, DELETE, MOVE');
       switch (req.method) {
         case 'OPTIONS': res.status(200).end(); return;
         case 'PROPFIND': await handlePropfind(req, res, identity, segments); return;
+        case 'PROPPATCH': await handleProppatch(req, res, identity, segments); return;
         case 'GET': case 'HEAD': await handleGet(req, res, identity, segments); return;
         case 'PUT': await handlePut(req, res, identity, segments); return;
         case 'MKCOL': await handleMkcol(req, res, identity, segments); return;

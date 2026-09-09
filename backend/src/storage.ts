@@ -42,18 +42,41 @@ export function isHiddenResource(name: string, metadata?: Record<string, unknown
   return false;
 }
 
-export function originalCreatedAtFromMetadata(metadata: Record<string, unknown>): Date | undefined {
-  const keys = [
-    'EXIF:DateTimeOriginal', 'XMP-exif:DateTimeOriginal', 'QuickTime:CreateDate',
-    'PDF:CreateDate', 'XMP:CreateDate', 'XMP-xmp:CreateDate', 'File:FileCreateDate',
-  ];
-  const value = keys.map((key) => metadata[key]).find((candidate) => typeof candidate === 'string' && candidate.trim());
+export const ORIGINAL_CREATION_METADATA_KEYS = [
+  'Composite:SubSecDateTimeOriginal', 'ExifIFD:DateTimeOriginal', 'EXIF:DateTimeOriginal',
+  'XMP-exif:DateTimeOriginal', 'Keys:CreationDate', 'UserData:DateTimeOriginal', 'QuickTime:CreationDate',
+  'QuickTime:CreateDate', 'Matroska:DateTimeOriginal', 'PDF:CreateDate', 'XMP-photoshop:DateCreated',
+  'XMP:CreateDate', 'XMP-xmp:CreateDate', 'ExifIFD:CreateDate', 'EXIF:CreateDate',
+  'Track1:MediaCreateDate', 'Track1:TrackCreateDate',
+] as const;
+
+function metadataDate(value: unknown, offset?: unknown): Date | undefined {
   if (typeof value !== 'string') return undefined;
-  const normalized = value.trim()
-    .replace(/^(\d{4}):(\d{2}):(\d{2})/, '$1-$2-$3')
-    .replace(' ', 'T');
-  const date = new Date(normalized);
+  const match = value.trim().match(/^(\d{4})[:-](\d{2})[:-](\d{2})(?:[ T](\d{2}):(\d{2}):(\d{2})(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$/);
+  if (!match) return undefined;
+  const [, year, month, day, hour = '00', minute = '00', second = '00', fraction = ''] = match;
+  if (Number(year) === 0 || Number(hour) > 23 || Number(minute) > 59 || Number(second) > 59) return undefined;
+  const calendar = new Date(`${year}-${month}-${day}T00:00:00Z`);
+  if (!Number.isFinite(calendar.getTime()) || calendar.getUTCMonth() + 1 !== Number(month) || calendar.getUTCDate() !== Number(day))
+    return undefined;
+  const separateOffset = typeof offset === 'string' && /^[+-]\d{2}:?\d{2}$/.test(offset.trim()) ? offset.trim() : undefined;
+  // Exif dates without an offset remain available verbatim in metadata; index deterministically in UTC.
+  const timezone = match[8] ?? separateOffset ?? 'Z';
+  const date = new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}${fraction}${timezone}`);
   return Number.isFinite(date.getTime()) ? date : undefined;
+}
+
+export function originalCreatedAtFromMetadata(metadata: Record<string, unknown>): Date | undefined {
+  const trackKeys = Object.keys(metadata).filter((key) => /^Track\d+:(Media|Track)CreateDate$/.test(key)).sort();
+  for (const key of [...ORIGINAL_CREATION_METADATA_KEYS, ...trackKeys]) {
+    const group = key.split(':', 1)[0];
+    const offset = key.endsWith(':DateTimeOriginal') ? metadata[`${group}:OffsetTimeOriginal`]
+      : key.endsWith(':CreateDate') ? metadata[`${group}:OffsetTimeDigitized`] : undefined;
+    const date = metadataDate(metadata[key], offset);
+    if (date) return date;
+  }
+  // Filesystem birth/modify times describe the server copy, not the uploaded original.
+  return undefined;
 }
 
 export function userFilesRoot(storageKey: string): string {
@@ -134,9 +157,10 @@ export async function extractMetadata(filePath: string): Promise<Record<string, 
   const startedAt = process.hrtime.bigint();
   logger.trace({ event: 'metadata_extraction_started', filePath }, 'Read-only metadata extraction started');
   try {
-    const { stdout } = await execFileAsync('exiftool', ['-json', '-G1', '-n', filePath], {
+    const { stdout } = await execFileAsync('exiftool', ['-json', '-G1', '-n', '-api', 'QuickTimeUTC=1', filePath], {
       maxBuffer: 10 * 1024 * 1024,
       timeout: 30_000,
+      env: { ...process.env, TZ: 'UTC' },
     });
     const parsed = JSON.parse(stdout) as Record<string, unknown>[];
     const metadata = parsed[0] ?? {};

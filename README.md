@@ -87,12 +87,12 @@ docker compose logs -f backend
 | 경로 | 내용 | 백업 방식 |
 | --- | --- | --- |
 | `data/files/<storage-key>/` | 사용자별 원본 파일 바이트 | filesystem snapshot, `rsync` 등 |
-| `data/files/.originvault-thumbnails/` | SHA-256별 재생성 가능한 이미지·PDF 썸네일과 이미지 상세 미리보기 | 백업 선택 사항 |
+| `data/files/.originvault-thumbnails/` | SHA-256별 재생성 가능한 이미지·동영상·PDF 썸네일과 이미지 상세 미리보기 | 백업 선택 사항 |
 | `data/postgresql/` | PostgreSQL 물리 데이터 | 실행 중에는 복사하지 않고 `pg_dump` 사용 |
 | `data/logs/` | 일별 JSON 로그 | 운영 보관 정책에 따라 선택 |
 
 원본 파일은 미리보기 때문에 변환하거나 교체하지 않습니다. 이미지 썸네일은 WebP,
-PDF 첫 페이지 썸네일은 JPEG로 만들고, 브라우저가 직접 표시하지 못하는 이미지는 최대
+동영상 대표 프레임과 PDF 첫 페이지 썸네일은 JPEG로 만들고, 브라우저가 직접 표시하지 못하는 이미지는 최대
 2560px WebP 상세 미리보기를 별도 생성합니다. HEIC/HEIF, JPEG XL, JPEG 2000, TIFF,
 PSD/PSB, XCF, EXR/HDR, TGA, DDS, QOI, DICOM, PNM/PCX/FITS와 주요 카메라 RAW 형식을
 지원합니다. SVG는 sandbox가 적용된 원본을 표시하며 압축 SVGZ는 inline 표시하지
@@ -102,11 +102,43 @@ PSD/PSB, XCF, EXR/HDR, TGA, DDS, QOI, DICOM, PNM/PCX/FITS와 주요 카메라 RA
 backend는 시작 후 기존 활성·휴지통 파일의 누락 썸네일을 비동기로 채웁니다. 이후
 6시간마다 누락 썸네일 백필을 먼저 실행하고 캐시를 정리합니다. 어떤 활성·휴지통
 파일에서도 참조하지 않고 마지막 생성·재사용 후 24시간이 지난 캐시만 삭제합니다.
-이미지·PDF 렌더러는 동시에 최대 2개만 실행되며 ImageMagick은 coder allowlist와
-시간·메모리·디스크·이미지 크기 제한 안에서 동작합니다.
+동영상은 FFmpeg로 최대 512px 대표 프레임을 추출해 `<sha256>.video.jpg`로 저장합니다.
+일반·resumable·공개 공유·WebDAV 업로드에서 미리 생성하며, 캐시가 없는 동영상은
+목록 요청 시 생성한 뒤 이미지를 응답합니다. 보이는 항목의 요청은 백필 대기 작업보다
+우선 처리하고, 같은 파일의 백필이 이미 대기 중이면 그 작업의 우선순위를 올립니다.
+이미 실행 중인 렌더링은 완료 후 다음 작업을 시작합니다.
+
+일반·공개 공유·휴지통 목록의 이미지·동영상·PDF는 같은 이미지 로딩 경로를 사용합니다.
+화면 근처에서만 불러오고, 벗어나면 전송을 중단하며, 다시 들어오면 HTTP Range로
+이어받습니다. 완료한 썸네일은 메모리 캐시(최대 256 MiB / 5,000개)에서 재사용합니다.
+새로고침·로그아웃·캐시 한도에 따른 제거 후에는 다시 요청할 수 있습니다.
+
+이미지·동영상·PDF 렌더러는 동시에 최대 2개, 대기열은 최대 32개로 제한합니다.
+FFmpeg는 검증된 원본 파일 핸들과 제한된 protocol/컨테이너 형식으로 실행하며,
+ImageMagick은 coder allowlist와 시간·메모리·디스크·이미지 크기 제한 안에서 동작합니다.
 
 backend는 PostgreSQL advisory lock과 파일 변경 저널로 DB 색인과 파일 작업을 일관되게
 처리합니다. 같은 PostgreSQL 및 `data/` 경로에 backend를 두 개 이상 실행하지 않습니다.
+
+### WebDAV 원본 메타데이터
+
+PUT는 수신한 바이트의 SHA-256·크기를 계산하고 ExifTool로 MIME·EXIF·미디어 정보를
+읽습니다. 덮어쓰기는 새 바이트에서 메타데이터를 다시 추출합니다. EXIF 촬영일과 별도
+시간대 오프셋, QuickTime 생성일을 원본 생성일에 반영하며, 기존 색인에서 누락된
+촬영일도 서버 시작 시 저장된 메타데이터로 보완합니다. 시간대가 없는 EXIF 날짜는
+UTC 기준으로 색인하되 추출한 원문 날짜를 메타데이터에 보관합니다.
+
+원본 파일 수정시각은 클라이언트의 `X-OC-MTime`, `X-Upload-MTime`, `X-File-MTime`,
+`X-Last-Modified`, `Last-Modified` 헤더에서 읽습니다. PUT 이후 `PROPPATCH`로 전달하는
+`DAV:creationdate`, `DAV:getlastmodified`, Microsoft `Win32CreationTime`·
+`Win32LastModifiedTime`도 지원합니다. 클라이언트 파일 생성일은 `WebDAV:CreationDate`에
+별도로 보관하며 내장 촬영일을 덮어쓰지 않습니다. 날짜 속성 갱신과 MOVE는 원본 바이트를
+변경하지 않고, MOVE는 저장된 원본 날짜·메타데이터를 유지합니다.
+
+클라이언트가 수정시각을 전달하지 않으면 원본 수정일은 알 수 없음으로 보관합니다.
+서버 업로드 시간을 원본 수정일로 기록하지 않습니다. PROPFIND/GET은 알려진 원본 날짜를
+우선 반환하고, 없으면 서버 색인 날짜를 사용합니다. 지원하지 않는 PROPPATCH 속성이
+섞인 요청은 전체를 적용하지 않고 207 응답의 각 속성 상태로 실패를 알립니다.
 
 ## 데이터베이스 migration
 
@@ -127,9 +159,20 @@ health endpoint는 `200`을 반환해야 합니다. 인증 업로드, 공개 공
 
 ## 로컬 검증
 
+Backend 테스트에는 Node.js 24, FFmpeg(`libx264`/`mjpeg` 포함), ExifTool이 필요합니다.
+이미지/PDF 실제 변환에는 배포 Dockerfile의 ImageMagick 모듈과 Poppler도 설치합니다.
+
 ```sh
 (cd backend && npm ci && npm run build && npm test)
 (cd frontend && npm ci && npm run build)
+```
+
+WebDAV·동영상 통합 테스트는 PostgreSQL의 `CREATEDB` 권한이 있는 시험용 연결을 지정합니다.
+별도의 임시 DB를 생성해 실제 backend를 실행하고, 테스트 종료 시 그 DB를 삭제합니다.
+PostgreSQL 서버에는 `pgcrypto` 확장이 설치되어 있어야 합니다.
+
+```sh
+(cd backend && ORIGINVAULT_TEST_DATABASE_URL='postgresql://tester:password@127.0.0.1:5432/postgres' npm run test:integration)
 ```
 
 모바일 Expo 프로젝트는 Compose 배포와 분리되어 있으며

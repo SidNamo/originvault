@@ -10,11 +10,27 @@ const IMAGE_EXTENSIONS = new Set([
   "nef", "nrw", "orf", "pef", "raf", "raw", "rw2", "rwl", "sr2", "srf",
   "srw", "sti", "x3f",
 ]);
+const VIDEO_EXTENSIONS = new Set([
+  "mp4", "m4v", "mov", "qt", "3gp", "3g2", "f4v", "mkv", "webm",
+  "avi", "divx", "wmv", "asf", "flv", "m2ts", "mpg", "mpeg", "mpe",
+  "m2v", "vob", "ogv", "rm", "rmvb", "mxf", "nut", "dv",
+]);
+
+function fileExtension(name: string): string {
+  return name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
+}
 
 export function isImageFile(name: string, mimeType?: string | null): boolean {
-  const extension = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
+  const extension = fileExtension(name);
   if (extension === "svgz") return false;
   const mime = mimeType?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
   if (mime.startsWith("image/") || mime === "application/dicom") return true;
   return IMAGE_EXTENSIONS.has(extension);
+}
+
+export function isVideoFile(name: string, mimeType?: string | null): boolean {
+  const extension = fileExtension(name);
+  const mime = mimeType?.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  if ((extension === "ts" || extension === "mts") && mime !== "video/mp2t") return false;
+  return mime.startsWith("video/") || VIDEO_EXTENSIONS.has(extension);
 }

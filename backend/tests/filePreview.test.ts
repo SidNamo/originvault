@@ -21,6 +21,9 @@ test('preview classification is case-insensitive and broad', () => {
   assert.equal(previewKind('DESIGN.PSD', 'application/octet-stream'), 'image');
   assert.equal(previewKind('COMPRESSED.SVGZ', 'image/svg+xml'), 'unsupported');
   assert.equal(previewKind('MOVIE.MKV'), 'video');
+  assert.equal(previewKind('MOVIE.M2TS', 'application/octet-stream'), 'video');
+  assert.equal(previewKind('MOVIE.MTS', 'video/mp2t'), 'video');
+  assert.equal(previewKind('module.mts', 'application/octet-stream'), 'text');
   assert.equal(previewKind('TRACK.FLAC'), 'audio');
   assert.equal(previewKind('DOCUMENT.PDF'), 'pdf');
   assert.equal(previewKind('archive.ZIP'), 'unsupported');

@@ -75,6 +75,11 @@ const VIDEO_MIME: Record<string, string> = {
   mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', ogv: 'video/ogg',
   mov: 'video/quicktime', mkv: 'video/x-matroska', avi: 'video/x-msvideo',
   wmv: 'video/x-ms-wmv', flv: 'video/x-flv', '3gp': 'video/3gpp', ts: 'video/mp2t',
+  mts: 'video/mp2t', m2ts: 'video/mp2t', qt: 'video/quicktime', '3g2': 'video/3gpp2',
+  f4v: 'video/mp4', divx: 'video/x-msvideo', asf: 'video/x-ms-asf',
+  mpg: 'video/mpeg', mpeg: 'video/mpeg', mpe: 'video/mpeg', m2v: 'video/mpeg', vob: 'video/mpeg',
+  rm: 'application/vnd.rn-realmedia', rmvb: 'application/vnd.rn-realmedia-vbr', mxf: 'application/mxf',
+  nut: 'video/x-nut', dv: 'video/dv',
 };
 const AUDIO_MIME: Record<string, string> = {
   mp3: 'audio/mpeg', wav: 'audio/wav', wave: 'audio/wav', ogg: 'audio/ogg', oga: 'audio/ogg',
@@ -104,7 +109,7 @@ export function isEditableTextFile(name: string, mimeType = ''): boolean {
   const ext = extension(name);
   const base = path.basename(name).toLowerCase();
   const mime = mimeType.split(';', 1)[0]!.trim().toLowerCase();
-  if (ext === 'ts' && mime === 'video/mp2t') return false;
+  if ((ext === 'ts' || ext === 'mts') && mime === 'video/mp2t') return false;
   return SUBTITLE_EXTENSIONS.has(ext) || TEXT_EXTENSIONS.has(ext) || TEXT_NAMES.has(base)
     || mime.startsWith('text/')
     || /^(application\/(json|xml|yaml|toml|javascript|sql|graphql))$/i.test(mime);
@@ -114,11 +119,11 @@ export function previewKind(name: string, mimeType = ''): PreviewKind {
   const ext = extension(name);
   const mime = mimeType.split(';', 1)[0]!.trim().toLowerCase();
   if (SUBTITLE_EXTENSIONS.has(ext)) return 'subtitle';
-  if (ext === 'ts' && mime === 'video/mp2t') return 'video';
+  if ((ext === 'ts' || ext === 'mts') && mime === 'video/mp2t') return 'video';
   if (ext === 'svgz') return 'unsupported';
   if (isEditableTextFile(name, mimeType)) return 'text';
   if (IMAGE_MIME[ext] || thumbnailKind(name, mimeType) === 'image' || mime.startsWith('image/')) return 'image';
-  if (VIDEO_MIME[ext] || mime.startsWith('video/')) return 'video';
+  if (VIDEO_MIME[ext] || thumbnailKind(name, mimeType) === 'video' || mime.startsWith('video/')) return 'video';
   if (AUDIO_MIME[ext] || mime.startsWith('audio/')) return 'audio';
   if (ext === 'pdf' || mime === 'application/pdf') return 'pdf';
   return 'unsupported';

@@ -9,6 +9,7 @@ RUN npm run build
 FROM node:24-alpine3.23
 RUN apk add --no-cache \
     exiftool \
+    ffmpeg \
     imagemagick \
     imagemagick-heic \
     imagemagick-jp2 \
@@ -26,6 +27,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 COPY imagemagick-policy.xml /etc/ImageMagick-7/policy.xml
+RUN ffmpeg -version && ffmpeg -hide_banner -encoders | grep -Eq '[[:space:]]mjpeg[[:space:]]'
 RUN magick -list format | grep -Eq '^[[:space:]]*HEIC[[:space:]]+HEIC[[:space:]]+r' \
     && magick -list format | grep -Eq '^[[:space:]]*JP2[*]?[[:space:]]+JP2[[:space:]]+r' \
     && magick -list format | grep -Eq '^[[:space:]]*JXL[*]?[[:space:]]+JXL[[:space:]]+r' \

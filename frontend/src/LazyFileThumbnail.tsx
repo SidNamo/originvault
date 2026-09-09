@@ -172,8 +172,8 @@ export function LazyFileThumbnail({
     mimeType?.split(";", 1)[0]?.trim().toLowerCase() === "image/svg+xml" ||
     /\.svg$/i.test(fileName)
   );
-  const pausableImage = kind === "image" || kind === "pdf";
-  const serverThumbnail = kind === "pdf" || (kind === "image" && !nativeOnlyImage);
+  const pausableImage = previewable;
+  const serverThumbnail = kind === "video" || kind === "pdf" || (kind === "image" && !nativeOnlyImage);
   const handlePreviewRequestError = (failedUrl: string, status?: number) => {
     if (!failedUrl || failedUrl !== previewUrl) return;
     const canRefreshTicket = status === 401 || status === 403 || status === 404;
@@ -290,7 +290,6 @@ export function LazyFileThumbnail({
     };
   }, [fileId, imageUrl, nearViewport, pausableImage, previewUrl, previewable, resourceKey, serverThumbnail, shareToken, source, ticketRequestAttempt, version]);
 
-  const videoUrl = nearViewport && kind === "video" ? previewUrl : undefined;
   return (
     <div ref={containerRef} className="file-preview-thumb" aria-hidden="true">
       {!previewFailed && imageUrl && pausableImage ? (
@@ -309,20 +308,6 @@ export function LazyFileThumbnail({
               ? handlePreviewRequestError(previewUrl, 404)
               : setFailedResourceKey(resourceKey)
           }
-        />
-      ) : !previewFailed && videoUrl ? (
-        <video
-          src={videoUrl}
-          muted
-          playsInline
-          preload="metadata"
-          onLoadedMetadata={() => {
-            ticketRefreshRef.current.count = 0;
-            setFailedResourceKey((current) =>
-              current === resourceKey ? undefined : current,
-            );
-          }}
-          onError={() => handlePreviewRequestError(videoUrl, 404)}
         />
       ) : (
         <Fallback size={36} />

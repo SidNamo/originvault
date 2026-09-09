@@ -76,6 +76,7 @@ export async function backfillMissingThumbnails(
       const thumbnail = await getOrCreateThumbnail({
         sourcePath: thumbnailBackfillSourcePath(file),
         verifySourceHash: true,
+        priority: 'background',
         sha256,
         name: file.name,
         mimeType: file.mimeType,

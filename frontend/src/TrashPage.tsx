@@ -3,7 +3,7 @@ import { CheckSquare, ChevronLeft, File, FileImage, FileVideo, Folder, FolderOpe
 import { api, type FilePreview, type StorageUsage, type TrashFolder, type TrashFolderContents, type TrashItem, type VaultFile } from "./api";
 import { CollisionDialog } from "./CollisionDialog";
 import { formatBytes } from "./format";
-import { isImageFile } from "./fileKinds";
+import { isImageFile, isVideoFile } from "./fileKinds";
 import { PreviewViewer } from "./PreviewViewer";
 import { ListingControls, type ListingSortDirection, type ListingSortField, type ListingViewMode } from "./ListingControls";
 import { LazyFileThumbnail } from "./LazyFileThumbnail";
@@ -345,9 +345,10 @@ export function TrashPage({
               const action = toAction({ type: "file", id: item.id, name: item.name });
               const key = actionKey(action);
               const imageFile = isImageFile(item.name, item.mimeType);
-              const Icon = imageFile ? FileImage : item.mimeType.startsWith("video/") ? FileVideo : File;
+              const videoFile = isVideoFile(item.name, item.mimeType);
+              const Icon = imageFile ? FileImage : videoFile ? FileVideo : File;
               return <article data-trash-select-key={key} className={`trash-item ${selectedKeys.has(key) ? "selected" : ""}`} key={`file:${item.id}`} onClick={(event) => handleCardClick(key, event)} onDoubleClick={() => openPreview(item)} onContextMenu={(event) => showMenu(event, action)}>
-                {viewMode === "preview" ? <LazyFileThumbnail fileId={item.id} fileName={item.name} mimeType={item.mimeType} version={item.sha256} kind={imageFile ? "image" : item.mimeType.startsWith("video/") ? "video" : item.mimeType === "application/pdf" || /\.pdf$/i.test(item.name) ? "pdf" : "unsupported"} source="trash" fallback={Icon} /> : <div className="trash-kind"><Icon /></div>}
+                {viewMode === "preview" ? <LazyFileThumbnail fileId={item.id} fileName={item.name} mimeType={item.mimeType} version={item.sha256} kind={imageFile ? "image" : videoFile ? "video" : item.mimeType === "application/pdf" || /\.pdf$/i.test(item.name) ? "pdf" : "unsupported"} source="trash" fallback={Icon} /> : <div className="trash-kind"><Icon /></div>}
                 <div className="trash-item-main"><strong>{item.name}</strong><small>{formatBytes(item.sizeBytes)} · 파일 미리보기</small></div>
                 <button className="icon-action" title="메뉴" onClick={(event) => showMenu(event, action)}><MoreHorizontal /></button>
               </article>;
@@ -357,11 +358,12 @@ export function TrashPage({
           const action = toAction(item, true);
           const key = actionKey(action);
           const imageFile = item.type === "file" && isImageFile(item.name, item.mimeType);
-          const Icon = item.type === "folder" ? Folder : imageFile ? FileImage : item.mimeType?.startsWith("video/") ? FileVideo : File;
+          const videoFile = item.type === "file" && isVideoFile(item.name, item.mimeType);
+          const Icon = item.type === "folder" ? Folder : imageFile ? FileImage : videoFile ? FileVideo : File;
           return <article data-trash-select-key={key} className={`trash-item ${selectedKeys.has(key) ? "selected" : ""}`} key={`${item.type}:${item.id}`} onClick={(event) => handleCardClick(key, event)} onDoubleClick={() => item.type === "folder"
             ? openFolder({ id: item.id, name: item.name, parentId: null, createdAt: item.trashedAt, modifiedAt: item.trashedAt, trashedAt: item.trashedAt })
             : openPreview(item)} onContextMenu={(event) => showMenu(event, action)}>
-            {viewMode === "preview" ? item.type === "folder" ? <div className="file-preview-thumb folder-thumb" aria-hidden="true"><Folder /></div> : <LazyFileThumbnail fileId={item.id} fileName={item.name} mimeType={item.mimeType ?? undefined} version={item.trashedAt} kind={imageFile ? "image" : item.mimeType?.startsWith("video/") ? "video" : item.mimeType === "application/pdf" || /\.pdf$/i.test(item.name) ? "pdf" : "unsupported"} source="trash" fallback={Icon} /> : <div className="trash-kind"><Icon /></div>}
+            {viewMode === "preview" ? item.type === "folder" ? <div className="file-preview-thumb folder-thumb" aria-hidden="true"><Folder /></div> : <LazyFileThumbnail fileId={item.id} fileName={item.name} mimeType={item.mimeType ?? undefined} version={item.trashedAt} kind={imageFile ? "image" : videoFile ? "video" : item.mimeType === "application/pdf" || /\.pdf$/i.test(item.name) ? "pdf" : "unsupported"} source="trash" fallback={Icon} /> : <div className="trash-kind"><Icon /></div>}
             <div className="trash-item-main">
               <strong>{item.name}</strong>
               <small>{item.type === "folder" ? `파일 ${item.fileCount.toLocaleString("ko-KR")}개 · 폴더 ${Math.max(0, item.folderCount - 1).toLocaleString("ko-KR")}개` : "파일"}{` · ${formatBytes(item.sizeBytes)}`}</small>
