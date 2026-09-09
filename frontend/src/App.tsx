@@ -54,6 +54,7 @@ import {
 } from "./api";
 import { FolderTree } from "./FolderTree";
 import { formatBytes } from "./format";
+import { isImageFile } from "./fileKinds";
 import { PublicSharePage } from "./PublicSharePage";
 import { SettingsPage } from "./SettingsPage";
 import { SharesPage } from "./SharesPage";
@@ -2692,7 +2693,8 @@ function Dashboard({
           </span>
         </div>
       );
-    const Icon = item.mimeType.startsWith("image/")
+    const imageFile = isImageFile(item.name, item.mimeType);
+    const Icon = imageFile
       ? FileImage
       : item.mimeType.startsWith("video/")
         ? FileVideo
@@ -2730,7 +2732,7 @@ function Dashboard({
             mimeType={item.mimeType}
             version={item.version}
             kind={
-              item.mimeType.startsWith("image/")
+              imageFile
                 ? "image"
                 : item.mimeType.startsWith("video/")
                   ? "video"

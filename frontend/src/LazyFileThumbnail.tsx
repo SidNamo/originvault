@@ -170,7 +170,7 @@ export function LazyFileThumbnail({
   const previewable = kind === "image" || kind === "video" || kind === "pdf";
   const nativeOnlyImage = kind === "image" && (
     mimeType?.split(";", 1)[0]?.trim().toLowerCase() === "image/svg+xml" ||
-    /\.svgz?$/i.test(fileName)
+    /\.svg$/i.test(fileName)
   );
   const pausableImage = kind === "image" || kind === "pdf";
   const serverThumbnail = kind === "pdf" || (kind === "image" && !nativeOnlyImage);

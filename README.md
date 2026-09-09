@@ -87,12 +87,23 @@ docker compose logs -f backend
 | 경로 | 내용 | 백업 방식 |
 | --- | --- | --- |
 | `data/files/<storage-key>/` | 사용자별 원본 파일 바이트 | filesystem snapshot, `rsync` 등 |
-| `data/files/.originvault-thumbnails/` | SHA-256별 재생성 가능한 이미지·PDF 썸네일 | 백업 선택 사항 |
+| `data/files/.originvault-thumbnails/` | SHA-256별 재생성 가능한 이미지·PDF 썸네일과 이미지 상세 미리보기 | 백업 선택 사항 |
 | `data/postgresql/` | PostgreSQL 물리 데이터 | 실행 중에는 복사하지 않고 `pg_dump` 사용 |
 | `data/logs/` | 일별 JSON 로그 | 운영 보관 정책에 따라 선택 |
 
-썸네일 캐시는 서버 시작 시와 6시간마다 정리합니다. 어떤 활성·휴지통 파일에서도
-참조하지 않고 마지막 생성·재사용 후 24시간이 지난 캐시만 삭제합니다.
+원본 파일은 미리보기 때문에 변환하거나 교체하지 않습니다. 이미지 썸네일은 WebP,
+PDF 첫 페이지 썸네일은 JPEG로 만들고, 브라우저가 직접 표시하지 못하는 이미지는 최대
+2560px WebP 상세 미리보기를 별도 생성합니다. HEIC/HEIF, JPEG XL, JPEG 2000, TIFF,
+PSD/PSB, XCF, EXR/HDR, TGA, DDS, QOI, DICOM, PNM/PCX/FITS와 주요 카메라 RAW 형식을
+지원합니다. SVG는 sandbox가 적용된 원본을 표시하며 압축 SVGZ는 inline 표시하지
+않습니다.
+
+파생 캐시는 SHA-256을 키로 `data/files/.originvault-thumbnails/v1/` 아래에 저장합니다.
+backend는 시작 후 기존 활성·휴지통 파일의 누락 썸네일을 비동기로 채웁니다. 이후
+6시간마다 누락 썸네일 백필을 먼저 실행하고 캐시를 정리합니다. 어떤 활성·휴지통
+파일에서도 참조하지 않고 마지막 생성·재사용 후 24시간이 지난 캐시만 삭제합니다.
+이미지·PDF 렌더러는 동시에 최대 2개만 실행되며 ImageMagick은 coder allowlist와
+시간·메모리·디스크·이미지 크기 제한 안에서 동작합니다.
 
 backend는 PostgreSQL advisory lock과 파일 변경 저널로 DB 색인과 파일 작업을 일관되게
 처리합니다. 같은 PostgreSQL 및 `data/` 경로에 backend를 두 개 이상 실행하지 않습니다.

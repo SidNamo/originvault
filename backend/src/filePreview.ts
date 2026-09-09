@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { createReadStream, createWriteStream } from 'node:fs';
+import { constants, createReadStream, createWriteStream } from 'node:fs';
 import { link, mkdir, open, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { Transform, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -24,14 +24,18 @@ import {
 import { getStorageUsage, StorageQuotaError } from './quota.js';
 import { extractMetadata, resolveInside, userFilesRoot } from './storage.js';
 import {
+  getOrCreateImagePreview,
   getOrCreateThumbnail,
+  requiresGeneratedImagePreview,
+  sendImagePreview,
   sendThumbnail,
   thumbnailKind,
   type CachedThumbnail,
+  ThumbnailRendererBusyError,
 } from './thumbnails.js';
 
 export type PreviewKind = 'text' | 'subtitle' | 'image' | 'video' | 'audio' | 'pdf' | 'unsupported';
-type AccessMode = 'preview' | 'thumbnail' | 'download';
+type AccessMode = 'preview' | 'image-preview' | 'thumbnail' | 'download';
 
 function previewStagingRoot(): string {
   return mutationStagingRoot(PREVIEW_MUTATION_STAGING);
@@ -61,9 +65,11 @@ const TEXT_NAMES = new Set([
 ]);
 const SUBTITLE_EXTENSIONS = new Set(['vtt', 'srt', 'ass', 'ssa', 'lrc']);
 const IMAGE_MIME: Record<string, string> = {
-  jpg: 'image/jpeg', jpeg: 'image/jpeg', jpe: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+  jpg: 'image/jpeg', jpeg: 'image/jpeg', jpe: 'image/jpeg', jfif: 'image/jpeg', pjpeg: 'image/jpeg',
+  png: 'image/png', apng: 'image/apng', gif: 'image/gif',
   webp: 'image/webp', avif: 'image/avif', bmp: 'image/bmp', svg: 'image/svg+xml',
-  ico: 'image/x-icon', tif: 'image/tiff', tiff: 'image/tiff', heic: 'image/heic', heif: 'image/heif',
+  ico: 'image/x-icon', tif: 'image/tiff', tiff: 'image/tiff',
+  heic: 'image/heic', heics: 'image/heic-sequence', heif: 'image/heif', heifs: 'image/heif-sequence', hif: 'image/heif',
 };
 const VIDEO_MIME: Record<string, string> = {
   mp4: 'video/mp4', m4v: 'video/mp4', webm: 'video/webm', ogv: 'video/ogg',
@@ -109,8 +115,9 @@ export function previewKind(name: string, mimeType = ''): PreviewKind {
   const mime = mimeType.split(';', 1)[0]!.trim().toLowerCase();
   if (SUBTITLE_EXTENSIONS.has(ext)) return 'subtitle';
   if (ext === 'ts' && mime === 'video/mp2t') return 'video';
+  if (ext === 'svgz') return 'unsupported';
   if (isEditableTextFile(name, mimeType)) return 'text';
-  if (IMAGE_MIME[ext] || mime.startsWith('image/')) return 'image';
+  if (IMAGE_MIME[ext] || thumbnailKind(name, mimeType) === 'image' || mime.startsWith('image/')) return 'image';
   if (VIDEO_MIME[ext] || mime.startsWith('video/')) return 'video';
   if (AUDIO_MIME[ext] || mime.startsWith('audio/')) return 'audio';
   if (ext === 'pdf' || mime === 'application/pdf') return 'pdf';
@@ -230,7 +237,8 @@ function previewIdentity(token: string): { id: string; userId: string; sha256: s
     }) as JwtPayload;
     if (!payload.sub || typeof payload.userId !== 'string' || typeof payload.sha256 !== 'string'
       || !Number.isInteger(payload.authVersion)
-      || (payload.mode !== 'preview' && payload.mode !== 'thumbnail' && payload.mode !== 'download')) throw new Error('Invalid preview token');
+      || (payload.mode !== 'preview' && payload.mode !== 'image-preview'
+        && payload.mode !== 'thumbnail' && payload.mode !== 'download')) throw new Error('Invalid preview token');
     return { id: payload.sub, userId: payload.userId, sha256: payload.sha256, authVersion: payload.authVersion, mode: payload.mode, trashed: payload.trashed === true };
   } catch {
     throw new PreviewError(404, 'Preview not found');
@@ -310,8 +318,11 @@ async function sendFilePreview(req: Request, res: Response, trashed: boolean): P
       : undefined;
     return { file, kind, siblingRows, text };
   });
+  const mode: AccessMode = kind === 'image' && requiresGeneratedImagePreview(file.name, file.mimeType)
+    ? 'image-preview'
+    : 'preview';
   const streamUrl = isStreamPreviewKind(kind)
-    ? `/api/previews/${encodeURIComponent(previewToken({ id: file.id, userId: req.user!.id, sha256: file.sha256, authVersion: req.user!.authVersion }, 'preview', trashed))}`
+    ? `/api/previews/${encodeURIComponent(previewToken({ id: file.id, userId: req.user!.id, sha256: file.sha256, authVersion: req.user!.authVersion }, mode, trashed))}`
     : undefined;
   const subtitles = kind === 'video' || kind === 'audio'
     ? siblingRows
@@ -357,7 +368,7 @@ async function sendFileText(req: Request, res: Response, trashed: boolean): Prom
       const detected = await detectTextEncoding(absolutePath, file.textEncoding, file.textHasBom);
       const encoding = req.query.encoding && req.query.encoding !== 'auto' ? normalizeEncoding(req.query.encoding) : detected.encoding!;
       await assertLosslessTextDecoding(absolutePath, encoding);
-      fileHandle = await open(absolutePath, 'r');
+      fileHandle = await open(absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW);
       return { file, detected, encoding };
     });
   } catch (error) {
@@ -631,9 +642,10 @@ export function createFilePreviewRouter(): express.Router {
     const identity = previewIdentity(String(req.params.token));
     const client = await db.connect();
     let fileHandle: Awaited<ReturnType<typeof open>> | undefined;
-    let thumbnail: CachedThumbnail | undefined;
+    let generatedImage: CachedThumbnail | undefined;
     let file: any;
     let fileSize = 0;
+    let absolutePath = '';
     try {
       await client.query('BEGIN');
       await client.query('SELECT pg_advisory_xact_lock_shared(hashtext($1))', [`originvault:${identity.userId}`]);
@@ -652,28 +664,12 @@ export function createFilePreviewRouter(): express.Router {
       `, [identity.id, identity.userId, identity.sha256, identity.authVersion, identity.trashed]);
       if (!result.rowCount) throw new PreviewError(404, 'Preview not found');
       file = result.rows[0];
-      const absolutePath = storedFilePath(file, file.storageKey);
-      fileHandle = await open(absolutePath, 'r');
+      absolutePath = storedFilePath(file, file.storageKey);
+      fileHandle = await open(absolutePath, constants.O_RDONLY | constants.O_NOFOLLOW);
       const fileStat = await fileHandle.stat();
       if (!fileStat.isFile() || BigInt(fileStat.size) !== BigInt(file.sizeBytes))
         throw new PreviewError(409, 'Stored content is inconsistent');
       fileSize = fileStat.size;
-      if (identity.mode === 'thumbnail') {
-        try {
-          thumbnail = await getOrCreateThumbnail({
-            sourcePath: absolutePath,
-            sha256: file.sha256,
-            name: file.name,
-            mimeType: file.mimeType,
-          });
-        } catch (error) {
-          logForRequest(req).warn({ event: 'thumbnail_generation_failed', fileId: identity.id, err: error }, 'Server thumbnail generation failed');
-          throw new PreviewError(422, 'A thumbnail could not be generated for this file');
-        }
-        if (!thumbnail) throw new PreviewError(415, 'This file does not support a server thumbnail');
-        await fileHandle.close();
-        fileHandle = undefined;
-      }
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
@@ -682,8 +678,50 @@ export function createFilePreviewRouter(): express.Router {
     } finally {
       client.release();
     }
+    if (identity.mode === 'thumbnail' || identity.mode === 'image-preview') {
+      try {
+        generatedImage = await (identity.mode === 'thumbnail'
+          ? getOrCreateThumbnail({
+              sourcePath: absolutePath,
+              sourceHandle: fileHandle,
+              sha256: file.sha256,
+              name: file.name,
+              mimeType: file.mimeType,
+            })
+          : getOrCreateImagePreview({
+              sourcePath: absolutePath,
+              sourceHandle: fileHandle,
+              sha256: file.sha256,
+              name: file.name,
+              mimeType: file.mimeType,
+            }));
+      } catch (error) {
+        if (error instanceof ThumbnailRendererBusyError) {
+          res.setHeader('Retry-After', '5');
+          throw new PreviewError(503, 'Image rendering is temporarily busy');
+        }
+        const event = identity.mode === 'thumbnail' ? 'thumbnail_generation_failed' : 'image_preview_generation_failed';
+        logForRequest(req).warn({ event, fileId: identity.id, err: error }, 'Server image derivative generation failed');
+        throw new PreviewError(422, identity.mode === 'thumbnail'
+          ? 'A thumbnail could not be generated for this file'
+          : 'A browser-compatible preview could not be generated for this image');
+      } finally {
+        await fileHandle?.close().catch(() => undefined);
+        fileHandle = undefined;
+      }
+      if (!generatedImage) throw new PreviewError(415, identity.mode === 'thumbnail'
+        ? 'This file does not support a server thumbnail'
+        : 'This file does not require a generated image preview');
+    }
     if (identity.mode === 'thumbnail') {
-      await sendThumbnail(req, res, thumbnail!, identity.sha256);
+      await sendThumbnail(req, res, generatedImage!, identity.sha256);
+      return;
+    }
+    if (identity.mode === 'image-preview') {
+      res.setHeader('Content-Disposition', inlineDisposition(file.name));
+      res.setHeader('X-Content-SHA256', file.sha256);
+      res.setHeader('Referrer-Policy', 'no-referrer');
+      await sendImagePreview(req, res, generatedImage!, identity.sha256);
       return;
     }
     const kind = previewKind(file.name, file.mimeType);

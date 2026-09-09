@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<policymap>
+  <policy domain="resource" name="thread" value="2"/>
+  <policy domain="resource" name="time" value="35"/>
+  <policy domain="resource" name="file" value="32"/>
+  <policy domain="resource" name="memory" value="128MiB"/>
+  <policy domain="resource" name="map" value="256MiB"/>
+  <policy domain="resource" name="area" value="100MP"/>
+  <policy domain="resource" name="disk" value="512MiB"/>
+  <policy domain="resource" name="list-length" value="16"/>
+  <policy domain="resource" name="width" value="16KP"/>
+  <policy domain="resource" name="height" value="16KP"/>
+  <policy domain="delegate" rights="none" pattern="*"/>
+  <policy domain="filter" rights="none" pattern="*"/>
+  <policy domain="path" rights="none" pattern="@*"/>
+  <policy domain="coder" rights="none" pattern="*"/>
+  <policy domain="coder" rights="read" pattern="{BMP,DCM,DDS,DNG,EXR,FITS,HDR,HEIC,ICON,JP2,JPEG,JXL,PCX,PNM,PSD,QOI,TGA,TIFF,XCF}"/>
+  <policy domain="coder" rights="write" pattern="WEBP"/>
+  <policy domain="system" name="max-memory-request" value="128MiB"/>
+  <policy domain="system" name="memory-map" value="anonymous"/>
+  <policy domain="system" name="symlink" rights="none" pattern="follow"/>
+</policymap>

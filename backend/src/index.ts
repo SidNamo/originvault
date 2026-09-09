@@ -24,6 +24,7 @@ import { reconcileMutationJournals } from './mutationJournal.js';
 import { createRateLimiter } from './rateLimit.js';
 import { migrateLegacyTrashStorage, purgeExpiredTrash, TrashError, trashRouter, trashSelections } from './trash.js';
 import { prepareFileThumbnail, pruneUnusedThumbnails } from './thumbnails.js';
+import { backfillMissingThumbnails, type ThumbnailBackfillFile } from './thumbnailMaintenance.js';
 
 const app = express();
 const registrationRateLimit = createRateLimiter({ windowMs: 60 * 60 * 1_000, max: 5 });
@@ -607,6 +608,46 @@ app.use((error: any, _req: express.Request, res: express.Response, _next: expres
 });
 
 let thumbnailCleanupRunning = false;
+let thumbnailBackfillRunning = false;
+let thumbnailMaintenanceRunning = false;
+
+async function backfillThumbnailCache(): Promise<void> {
+  if (thumbnailBackfillRunning) return;
+  thumbnailBackfillRunning = true;
+  const startedAt = process.hrtime.bigint();
+  try {
+    const result = await backfillMissingThumbnails(async (cursor, limit) => {
+      const files = await db.query<ThumbnailBackfillFile>(`
+        SELECT f.id,u.storage_key AS "storageKey",f.stored_name AS name,
+          f.relative_path AS "relativePath",f.mime_type AS "mimeType",f.sha256,
+          f.trashed_at AS "trashedAt",
+          COALESCE(trash_file_root.trash_storage_path,trash_folder_root.trash_storage_path) AS "trashStoragePath",
+          COALESCE(trash_file_root.relative_path,trash_folder_root.relative_path) AS "trashRootRelativePath"
+        FROM files f
+        JOIN users u ON u.id=f.user_id AND u.disabled_at IS NULL
+        LEFT JOIN files trash_file_root ON trash_file_root.id=f.trash_root_id
+        LEFT JOIN folders trash_folder_root ON trash_folder_root.id=f.trash_root_id
+        WHERE ($1::uuid IS NULL OR f.id > $1::uuid)
+        ORDER BY f.id
+        LIMIT $2
+      `, [cursor, limit]);
+      return files.rows;
+    });
+    const details = {
+      event: 'thumbnail_backfill_completed',
+      ...result,
+      durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000,
+    };
+    if (result.generatedThumbnails || result.unavailableFiles || result.failedThumbnails)
+      logger.info(details, 'Existing file thumbnail backfill completed');
+    else
+      logger.debug(details, 'Existing file thumbnail backfill found no missing thumbnails');
+  } catch (error) {
+    logger.error({ event: 'thumbnail_backfill_failed', err: error }, 'Existing file thumbnail backfill failed');
+  } finally {
+    thumbnailBackfillRunning = false;
+  }
+}
 
 async function purgeUnusedThumbnailCache(): Promise<void> {
   if (thumbnailCleanupRunning) return;
@@ -624,6 +665,17 @@ async function purgeUnusedThumbnailCache(): Promise<void> {
     logger.error({ event: 'thumbnail_cache_cleanup_failed', err: error }, 'Unused thumbnail cache cleanup failed');
   } finally {
     thumbnailCleanupRunning = false;
+  }
+}
+
+async function runThumbnailMaintenance(cleanup = true): Promise<void> {
+  if (thumbnailMaintenanceRunning) return;
+  thumbnailMaintenanceRunning = true;
+  try {
+    await backfillThumbnailCache();
+    if (cleanup) await purgeUnusedThumbnailCache();
+  } finally {
+    thumbnailMaintenanceRunning = false;
   }
 }
 
@@ -661,9 +713,10 @@ async function start(): Promise<void> {
   await purgeUnusedThumbnailCache();
   const trashCleanupTimer = setInterval(() => { void purgeExpiredTrash(); }, 6 * 60 * 60 * 1_000);
   trashCleanupTimer.unref();
-  const thumbnailCleanupTimer = setInterval(() => { void purgeUnusedThumbnailCache(); }, 6 * 60 * 60 * 1_000);
-  thumbnailCleanupTimer.unref();
+  const thumbnailMaintenanceTimer = setInterval(() => { void runThumbnailMaintenance(); }, 6 * 60 * 60 * 1_000);
+  thumbnailMaintenanceTimer.unref();
   const server = app.listen(config.port, () => logger.info({ event: 'service_ready', port: config.port }, 'OriginVault backend is ready'));
+  void runThumbnailMaintenance(false);
   // Node's default five-minute limit cuts off valid multi-gigabyte WebDAV uploads.
   const largeRequestTimeoutMs = 30 * 60 * 1_000;
   server.requestTimeout = largeRequestTimeoutMs;
@@ -672,7 +725,7 @@ async function start(): Promise<void> {
     logger.warn({ event: 'service_shutdown_started', signal }, 'OriginVault backend shutdown started');
     server.close(async (error) => {
       clearInterval(trashCleanupTimer);
-      clearInterval(thumbnailCleanupTimer);
+      clearInterval(thumbnailMaintenanceTimer);
       if (error) logger.error({ event: 'http_server_close_failed', err: error }, 'HTTP server close failed');
       await instanceLockClient.query("SELECT pg_advisory_unlock(hashtext('originvault:backend-instance'))").catch((lockError) => logger.error({ event: 'instance_lock_release_failed', err: lockError }, 'Backend instance lock release failed'));
       instanceLockClient.release();

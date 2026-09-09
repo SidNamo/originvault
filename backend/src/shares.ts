@@ -30,10 +30,15 @@ import { extractMetadata, isHiddenResource, originalCreatedAtFromMetadata, resol
 import { pruneEmptyActiveFolders, removeEmptyActiveFolderPaths } from './folderCleanup.js';
 import { moveSelectionsToTrash } from './trash.js';
 import {
+  getOrCreateImagePreview,
   getOrCreateThumbnail,
   prepareFileThumbnail,
+  requiresGeneratedImagePreview,
+  sendImagePreview,
   sendThumbnail,
   thumbnailKind,
+  type CachedThumbnail,
+  ThumbnailRendererBusyError,
 } from './thumbnails.js';
 
 export class ShareError extends Error {
@@ -1396,7 +1401,7 @@ export function createShareRouter(): express.Router {
       req,
       requestUuid(req.params.fileId, 'File not found'),
     );
-    const { file, fileHandle, fileSize } = opened;
+    const { file, fileHandle, fileSize, targetRealPath } = opened;
     const kind = previewKind(file.name, file.mimeType);
     if (kind === 'unsupported') {
       await fileHandle.close();
@@ -1432,6 +1437,36 @@ export function createShareRouter(): express.Router {
       res.setHeader('Content-Length', decoded.body.length);
       if (req.method === 'HEAD') res.end();
       else res.end(decoded.body);
+      return;
+    }
+
+    if (kind === 'image' && requiresGeneratedImagePreview(file.name, file.mimeType)) {
+      let preview: CachedThumbnail | undefined;
+      try {
+        preview = await getOrCreateImagePreview({
+          sourcePath: targetRealPath,
+          sourceHandle: fileHandle,
+          sha256: file.sha256,
+          name: file.name,
+          mimeType: file.mimeType,
+        });
+        if (!preview) throw new ShareError(415, 'This image does not require a generated preview');
+      } catch (error) {
+        if (error instanceof ShareError) throw error;
+        if (error instanceof ThumbnailRendererBusyError) {
+          res.setHeader('Retry-After', '5');
+          throw new ShareError(503, 'Image rendering is temporarily busy');
+        }
+        logForRequest(req).warn({ event: 'public_image_preview_generation_failed', shareId: opened.share.id, fileId: file.id, err: error }, 'Public browser-compatible image preview generation failed');
+        throw new ShareError(422, 'A browser-compatible preview could not be generated for this image');
+      } finally {
+        await fileHandle.close().catch(() => undefined);
+      }
+      setPublicResponseHeaders(res);
+      res.setHeader('Content-Disposition', inlineDisposition(file.name));
+      res.setHeader('X-Content-SHA256', file.sha256);
+      res.setHeader('Referrer-Policy', 'no-referrer');
+      await sendImagePreview(req, res, preview, file.sha256);
       return;
     }
 
@@ -1494,35 +1529,38 @@ export function createShareRouter(): express.Router {
     .get(publicPreviewHandler);
 
   const publicThumbnailHandler = asyncHandler(async (req, res) => {
-    const generated = await withActiveShareReadLock(req, async (share, client) => {
-      const file = await sharedFile(
-        share,
-        requestUuid(req.params.fileId, 'File not found'),
-        client,
-      );
-      if (!thumbnailKind(file.name, file.mimeType))
-        throw new ShareError(415, 'This file does not support a server thumbnail');
-      const opened = await openSharedRegularFile(share, file);
-      try {
-        const thumbnail = await getOrCreateThumbnail({
-          sourcePath: opened.targetRealPath,
-          sha256: file.sha256,
-          name: file.name,
-          mimeType: file.mimeType,
-        });
-        if (!thumbnail)
-          throw new ShareError(415, 'This file does not support a server thumbnail');
-        return { thumbnail, sha256: file.sha256 };
-      } catch (error) {
-        if (error instanceof ShareError) throw error;
-        logForRequest(req).warn({ event: 'public_thumbnail_generation_failed', shareId: share.id, fileId: file.id, err: error }, 'Public server thumbnail generation failed');
-        throw new ShareError(422, 'A thumbnail could not be generated for this file');
-      } finally {
-        await opened.fileHandle.close().catch(() => undefined);
+    const opened = await openAuthorizedSharedFile(
+      req,
+      requestUuid(req.params.fileId, 'File not found'),
+    );
+    const { file, fileHandle, targetRealPath } = opened;
+    if (!thumbnailKind(file.name, file.mimeType)) {
+      await fileHandle.close();
+      throw new ShareError(415, 'This file does not support a server thumbnail');
+    }
+    let thumbnail: CachedThumbnail | undefined;
+    try {
+      thumbnail = await getOrCreateThumbnail({
+        sourcePath: targetRealPath,
+        sourceHandle: fileHandle,
+        sha256: file.sha256,
+        name: file.name,
+        mimeType: file.mimeType,
+      });
+      if (!thumbnail) throw new ShareError(415, 'This file does not support a server thumbnail');
+    } catch (error) {
+      if (error instanceof ShareError) throw error;
+      if (error instanceof ThumbnailRendererBusyError) {
+        res.setHeader('Retry-After', '5');
+        throw new ShareError(503, 'Thumbnail rendering is temporarily busy');
       }
-    });
+      logForRequest(req).warn({ event: 'public_thumbnail_generation_failed', shareId: opened.share.id, fileId: file.id, err: error }, 'Public server thumbnail generation failed');
+      throw new ShareError(422, 'A thumbnail could not be generated for this file');
+    } finally {
+      await fileHandle.close().catch(() => undefined);
+    }
     setPublicResponseHeaders(res);
-    await sendThumbnail(req, res, generated.thumbnail, generated.sha256);
+    await sendThumbnail(req, res, thumbnail, file.sha256);
   });
   router.route('/api/public/shares/:token/files/:fileId/thumbnail')
     .head(publicThumbnailHandler)

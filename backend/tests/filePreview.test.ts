@@ -16,6 +16,10 @@ test('preview classification is case-insensitive and broad', () => {
   assert.equal(isEditableTextFile('notes.unknown', 'text/plain'), true);
   assert.equal(previewKind('CAPTIONS.SRT'), 'subtitle');
   assert.equal(previewKind('PHOTO.JPEG'), 'image');
+  assert.equal(previewKind('IPHONE.HEIC', 'application/octet-stream'), 'image');
+  assert.equal(previewKind('CAMERA.CR3', 'application/octet-stream'), 'image');
+  assert.equal(previewKind('DESIGN.PSD', 'application/octet-stream'), 'image');
+  assert.equal(previewKind('COMPRESSED.SVGZ', 'image/svg+xml'), 'unsupported');
   assert.equal(previewKind('MOVIE.MKV'), 'video');
   assert.equal(previewKind('TRACK.FLAC'), 'audio');
   assert.equal(previewKind('DOCUMENT.PDF'), 'pdf');
