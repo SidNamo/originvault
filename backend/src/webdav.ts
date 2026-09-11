@@ -20,8 +20,9 @@ import {
   writeMutationJournal,
 } from './mutationJournal.js';
 import { assertStorageAvailable, getStorageUsage, StorageQuotaError, type StorageUsage } from './quota.js';
-import { extractMetadata, isHiddenResource, originalCreatedAtFromMetadata, resolveInside, safeSegment, userFilesRoot } from './storage.js';
-import { prepareFileThumbnail } from './thumbnails.js';
+import { extractMetadata, isHiddenResource, originalCreatedAtFromMetadata, resolveInside, safeSegment, storedContentType, userFilesRoot } from './storage.js';
+import { scheduleFileThumbnail } from './thumbnails.js';
+import { requestBody } from './requestBody.js';
 import { pruneEmptyActiveFolders, removeEmptyActiveFolderPaths } from './folderCleanup.js';
 import { moveSelectionsToTrash } from './trash.js';
 import { parseWebdavDateProperties, parseWebdavMtime, type WebdavDateProperty } from './webdavProperties.js';
@@ -65,7 +66,6 @@ const asyncHandler = (handler: AsyncHandler) => (req: Request, res: Response, ne
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const TOKEN_PATTERN = /^ovd_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})_([A-Za-z0-9_-]{32,})$/i;
 const WEBDAV_MTIME_HEADERS = ['x-oc-mtime', 'x-upload-mtime', 'x-file-mtime', 'x-last-modified', 'last-modified'] as const;
-const MIME_TYPE_PATTERN = /^[\w!#$&^_.+-]+\/[\w!#$&^_.+-]+$/;
 
 function requestClientModifiedTime(req: Request): { value: Date; headerName: string } | null {
   for (const headerName of WEBDAV_MTIME_HEADERS) {
@@ -78,17 +78,8 @@ function requestClientModifiedTime(req: Request): { value: Date; headerName: str
   return null;
 }
 
-function normalizedMimeType(value: unknown): string | null {
-  if (typeof value !== 'string') return null;
-  const mimeType = value.split(';', 1)[0]!.trim().toLowerCase();
-  return mimeType && mimeType.length <= 255 && MIME_TYPE_PATTERN.test(mimeType) ? mimeType : null;
-}
-
 export function webdavContentType(requested: string | undefined, metadata: Record<string, unknown>): string {
-  const requestedMimeType = normalizedMimeType(requested);
-  const extractedMimeType = normalizedMimeType(metadata['File:MIMEType']);
-  if (extractedMimeType && extractedMimeType !== 'application/octet-stream') return extractedMimeType;
-  return requestedMimeType ?? extractedMimeType ?? 'application/octet-stream';
+  return storedContentType(requested, metadata);
 }
 
 export function webdavQuota(usage: Pick<StorageUsage, 'usedBytes' | 'reservedBytes' | 'quotaBytes'>): { usedBytes: string; availableBytes: string } | null {
@@ -444,7 +435,8 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
   if (existing?.type === 'folder') throw new DavError(405, 'A collection already exists at this path');
   let parent = await parentFolder(identity, segments);
   const declaredLength = req.header('content-length');
-  if (declaredLength && (!/^\d+$/.test(declaredLength) || BigInt(declaredLength) > BigInt(config.maxUploadBytes))) throw new DavError(413, 'File is too large');
+  if (declaredLength !== undefined && !/^\d+$/.test(declaredLength)) throw new DavError(400, 'Invalid Content-Length');
+  if (declaredLength && BigInt(declaredLength) > BigInt(config.maxUploadBytes)) throw new DavError(413, 'File is too large');
   if (declaredLength) {
     const declaredBytes = BigInt(declaredLength);
     const existingBytes = existing?.sizeBytes ? BigInt(existing.sizeBytes) : 0n;
@@ -496,6 +488,7 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
     const meter = new Transform({
       transform(chunk: Buffer, _encoding, callback) {
         size += BigInt(chunk.length);
+        if (size > BigInt(config.maxUploadBytes)) { callback(new DavError(413, 'File is too large')); return; }
         if (size > maximumTargetBytes) { callback(new StorageQuotaError()); return; }
         hash.update(chunk); callback(null, chunk);
       },
@@ -506,7 +499,7 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
       declaredSizeBytes: declaredLength,
     }, 'WebDAV upload stream started');
     try {
-      await pipeline(req, meter, createWriteStream(stagedPath, { flags: 'wx', mode: 0o600 }));
+      await pipeline(requestBody(req), meter, createWriteStream(stagedPath, { flags: 'wx', mode: 0o600 }));
     } catch (error) {
       logForRequest(req).warn({
         event: 'webdav_put_stream_failed',
@@ -519,6 +512,7 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
       throw error;
     }
     sha256 = hash.digest('hex');
+    if (declaredLength !== undefined && size !== BigInt(declaredLength)) throw new DavError(400, 'Upload body length does not match Content-Length');
     let requestedLastModified = clientModifiedTime?.value ?? new Date();
     try {
       await utimes(stagedPath, new Date(), requestedLastModified);
@@ -630,7 +624,7 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
     await client.query('COMMIT');
     transactionStarted = false;
     committed = true;
-    await prepareFileThumbnail({
+    scheduleFileThumbnail({
       sourcePath: targetPath,
       sha256,
       name,
@@ -959,11 +953,14 @@ export function createWebdavRouter(): express.Router {
       }
     })().catch((error: unknown) => {
       const statusCode = error instanceof DavError || error instanceof StorageQuotaError ? error.statusCode : 500;
-      if (statusCode === 401) res.setHeader('WWW-Authenticate', ['Basic realm="OriginVault WebDAV", charset="UTF-8"', 'Bearer realm="OriginVault WebDAV"']);
-      if (statusCode >= 500) logForRequest(req).error({ event: 'webdav_request_failed', err: error }, 'WebDAV request failed');
-      else logForRequest(req).warn({ event: 'webdav_request_rejected', statusCode, method: req.method }, 'WebDAV request rejected');
-      if (!res.headersSent) res.status(statusCode).type('text/plain').send(error instanceof Error ? error.message : 'WebDAV request failed');
-      else res.destroy(error instanceof Error ? error : new Error(String(error)));
+      const fields = { event: 'webdav_request_failed', statusCode, method: req.method, err: error, aborted: req.aborted, responseDestroyed: res.destroyed };
+      logForRequest(req)[statusCode >= 500 && statusCode !== 507 ? 'error' : 'warn'](fields, 'WebDAV request failed');
+      if (res.destroyed) return;
+      if (!res.headersSent) {
+        if (statusCode === 401) res.setHeader('WWW-Authenticate', ['Basic realm="OriginVault WebDAV", charset="UTF-8"', 'Bearer realm="OriginVault WebDAV"']);
+        if (!req.destroyed) req.resume();
+        res.status(statusCode).type('text/plain').send(error instanceof Error ? error.message : 'WebDAV request failed');
+      } else res.destroy(error instanceof Error ? error : new Error(String(error)));
     });
   });
   return router;

@@ -1,8 +1,21 @@
 import type { QueryResult } from 'pg';
 import { db } from './db.js';
+import { logger } from './logger.js';
 import { isHiddenResource, ORIGINAL_CREATION_METADATA_KEYS, originalCreatedAtFromMetadata } from './storage.js';
 
 type MetadataBackfillFile = { id: string; storedName: string; metadata: Record<string, unknown> };
+
+export async function backfillStoredContentTypes(): Promise<void> {
+  const result = await db.query(`
+    UPDATE files SET mime_type=lower(trim(split_part(extracted_metadata->>'File:MIMEType',';',1)))
+    WHERE extracted_metadata ? 'File:MIMEType'
+      AND lower(trim(split_part(extracted_metadata->>'File:MIMEType',';',1))) ~ '^[a-z0-9!#$&^_.+\\-]+/[a-z0-9!#$&^_.+\\-]+$'
+      AND length(trim(split_part(extracted_metadata->>'File:MIMEType',';',1))) <= 255
+      AND lower(trim(split_part(extracted_metadata->>'File:MIMEType',';',1))) <> 'application/octet-stream'
+      AND mime_type IS DISTINCT FROM lower(trim(split_part(extracted_metadata->>'File:MIMEType',';',1)))
+  `);
+  if (result.rowCount) logger.info({ event: 'stored_content_types_repaired', files: result.rowCount }, 'Stored MIME types repaired from original byte-derived metadata');
+}
 
 export async function backfillOriginalCreationTimes(): Promise<void> {
   let cursor: string | null = null;

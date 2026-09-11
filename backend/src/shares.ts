@@ -5,7 +5,6 @@ import { lstat, mkdir, open, realpath, rename, rm, unlink } from 'node:fs/promis
 import { pipeline } from 'node:stream/promises';
 import { ZipArchive } from 'archiver';
 import bcrypt from 'bcryptjs';
-import Busboy from 'busboy';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import iconv from 'iconv-lite';
 import jwt, { type JwtPayload } from 'jsonwebtoken';
@@ -13,7 +12,8 @@ import type { Pool, PoolClient } from 'pg';
 import { config } from './config.js';
 import { requireAuth } from './auth.js';
 import { db } from './db.js';
-import { assertStorageAvailable } from './quota.js';
+import { assertStorageAvailable, StorageQuotaError } from './quota.js';
+import { MultipartUploadError, receiveMultipartFile } from './multipartUpload.js';
 import { createRateLimiter } from './rateLimit.js';
 import {
   detectTextEncodingFromBytes,
@@ -26,19 +26,20 @@ import {
   safeInlineMime,
 } from './filePreview.js';
 import { logForRequest } from './logger.js';
-import { extractMetadata, isHiddenResource, originalCreatedAtFromMetadata, resolveInside, storeOriginal, userFilesRoot } from './storage.js';
+import { extractMetadata, isHiddenResource, originalCreatedAtFromMetadata, resolveInside, storedContentType, storeOriginal, userFilesRoot } from './storage.js';
 import { pruneEmptyActiveFolders, removeEmptyActiveFolderPaths } from './folderCleanup.js';
 import { moveSelectionsToTrash } from './trash.js';
 import {
   getOrCreateImagePreview,
   getOrCreateThumbnail,
-  prepareFileThumbnail,
+  scheduleFileThumbnail,
   requiresGeneratedImagePreview,
   sendImagePreview,
   sendThumbnail,
   thumbnailKind,
   type CachedThumbnail,
   ThumbnailRendererBusyError,
+  ThumbnailDeferredError,
 } from './thumbnails.js';
 
 export class ShareError extends Error {
@@ -1137,94 +1138,45 @@ export function createShareRouter(): express.Router {
     }
   }));
 
-  router.post('/api/public/shares/:token/upload', publicWriteRateLimit, (req, res, next) => {
+  router.post('/api/public/shares/:token/upload', publicWriteRateLimit, asyncHandler(async (req, res) => {
     const requestedFolderId = typeof req.query.folderId === 'string'
       ? requestUuid(req.query.folderId, 'Folder not found')
       : '';
-    if (!requestedFolderId) {
-      next(new ShareError(400, 'A destination folder is required'));
-      return;
-    }
-    let uploadPromise: Promise<{ id: string; name: string; sizeBytes: string; sha256: string }> | undefined;
-    let fileSeen = false;
-    try {
-      const busboy = Busboy({ headers: req.headers, limits: { fileSize: config.maxUploadBytes, files: 1, fields: 2 } });
-      busboy.on('file', (_field, stream, info) => {
-        if (fileSeen) {
-          stream.resume();
-          return;
-        }
-        fileSeen = true;
-        const originalName = info.filename;
-        const mimeType = info.mimeType || 'application/octet-stream';
-        stream.on('limit', () => stream.destroy(Object.assign(new Error('File is too large'), { code: 'LIMIT_FILE_SIZE' })));
-        uploadPromise = (async () => {
-          const client = await db.connect();
-          let stored: Awaited<ReturnType<typeof storeOriginal>> | undefined;
-          let committed = false;
-          try {
-            await client.query('BEGIN');
-            const preliminary = await activeShare(String(req.params.token), client, false, req);
-            await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`originvault:${preliminary.ownerUserId}`]);
-            const share = await activeShare(String(req.params.token), client, true, req);
-            assertShareWriteAccess(share);
-            const destination = await sharedFolder(share, requestedFolderId, client);
-            stored = await storeOriginal({
-              storageKey: share.storageKey,
-              username: share.username,
-              folderPath: destination.relativePath,
-              originalName,
-              stream,
-            });
-            const metadata = await extractMetadata(stored.absolutePath);
-            await assertStorageAvailable(share.ownerUserId, BigInt(stored.size), client);
-            const inserted = await client.query(`
-              INSERT INTO files(user_id,folder_id,original_name,stored_name,relative_path,mime_type,size_bytes,sha256,extracted_metadata,is_hidden,original_created_at)
-              VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-              RETURNING id
-            `, [
-              share.ownerUserId, destination.id, originalName, stored.storedName,
-              stored.relativePath, mimeType, stored.size, stored.sha256, metadata, isHiddenResource(stored.storedName, metadata), originalCreatedAtFromMetadata(metadata) ?? null,
-            ]);
-            await prepareFileThumbnail({
-              sourcePath: stored.absolutePath,
-              sha256: stored.sha256,
-              name: stored.storedName,
-              mimeType,
-            });
-            await client.query('COMMIT');
-            committed = true;
-            logForRequest(req).warn({ event: 'public_share_upload_completed', shareId: share.id, folderId: destination.id, fileId: inserted.rows[0]!.id, sizeBytes: stored.size }, 'Public share upload completed');
-            return { id: inserted.rows[0]!.id, name: originalName, sizeBytes: String(stored.size), sha256: stored.sha256 };
-          } catch (error) {
-            await client.query('ROLLBACK').catch(() => undefined);
-            if (stored && !committed) await unlink(stored.absolutePath).catch(() => undefined);
-            throw error;
-          } finally {
-            client.release();
-          }
-        })().catch((error) => {
-          stream.resume();
-          throw error;
-        });
-        void uploadPromise.catch(() => undefined);
-      });
-      busboy.on('error', next);
-      busboy.on('finish', async () => {
-        try {
-          if (!uploadPromise) throw new ShareError(400, 'A file is required');
-          const result = await uploadPromise;
-          setPublicResponseHeaders(res);
-          res.status(201).json(result);
-        } catch (error) {
-          next(error);
-        }
-      });
-      req.pipe(busboy);
-    } catch (error) {
-      next(error);
-    }
-  });
+    if (!requestedFolderId) throw new ShareError(400, 'A destination folder is required');
+    const result = await receiveMultipartFile(req, config.maxUploadBytes, async (file, _fields, parsed) => {
+      const client = await db.connect();
+      let stored: Awaited<ReturnType<typeof storeOriginal>> | undefined;
+      let committed = false;
+      try {
+        await client.query('BEGIN');
+        const preliminary = await activeShare(String(req.params.token), client, false, req);
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`originvault:${preliminary.ownerUserId}`]);
+        const share = await activeShare(String(req.params.token), client, true, req);
+        assertShareWriteAccess(share);
+        const destination = await sharedFolder(share, requestedFolderId, client);
+        stored = await storeOriginal({ storageKey: share.storageKey, username: share.username, folderPath: destination.relativePath, originalName: file.name, stream: file.stream });
+        await parsed;
+        const metadata = await extractMetadata(stored.absolutePath);
+        const mimeType = storedContentType(file.mimeType, metadata);
+        await assertStorageAvailable(share.ownerUserId, BigInt(stored.size), client);
+        const inserted = await client.query(`
+          INSERT INTO files(user_id,folder_id,original_name,stored_name,relative_path,mime_type,size_bytes,sha256,extracted_metadata,is_hidden,original_created_at)
+          VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING id
+        `, [share.ownerUserId, destination.id, file.name, stored.storedName, stored.relativePath, mimeType, stored.size, stored.sha256, metadata, isHiddenResource(stored.storedName, metadata), originalCreatedAtFromMetadata(metadata) ?? null]);
+        await client.query('COMMIT');
+        committed = true;
+        scheduleFileThumbnail({ sourcePath: stored.absolutePath, sha256: stored.sha256, name: stored.storedName, mimeType });
+        logForRequest(req).info({ event: 'public_share_upload_completed', shareId: share.id, folderId: destination.id, fileId: inserted.rows[0]!.id, sizeBytes: stored.size }, 'Public share upload completed');
+        return { id: inserted.rows[0]!.id, name: file.name, sizeBytes: String(stored.size), sha256: stored.sha256 };
+      } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        if (stored && !committed) await unlink(stored.absolutePath).catch(() => undefined);
+        throw error;
+      } finally { client.release(); }
+    });
+    setPublicResponseHeaders(res);
+    res.status(201).json(result);
+  }));
 
   router.delete('/api/public/shares/:token/items', publicWriteRateLimit, asyncHandler(async (req, res) => {
     const parsed = parsePublicArchiveRequest({ mode: 'selection', selections: req.body?.selections });
@@ -1457,7 +1409,8 @@ export function createShareRouter(): express.Router {
           res.setHeader('Retry-After', '5');
           throw new ShareError(503, 'Image rendering is temporarily busy');
         }
-        logForRequest(req).warn({ event: 'public_image_preview_generation_failed', shareId: opened.share.id, fileId: file.id, err: error }, 'Public browser-compatible image preview generation failed');
+        if (error instanceof ThumbnailDeferredError) res.setHeader('Retry-After', String(error.retryAfter));
+        logForRequest(req)[error instanceof ThumbnailDeferredError ? 'debug' : 'warn']({ event: 'public_image_preview_generation_failed', shareId: opened.share.id, fileId: file.id, err: error }, 'Public browser-compatible image preview generation failed');
         throw new ShareError(422, 'A browser-compatible preview could not be generated for this image');
       } finally {
         await fileHandle.close().catch(() => undefined);
@@ -1554,7 +1507,8 @@ export function createShareRouter(): express.Router {
         res.setHeader('Retry-After', '5');
         throw new ShareError(503, 'Thumbnail rendering is temporarily busy');
       }
-      logForRequest(req).warn({ event: 'public_thumbnail_generation_failed', shareId: opened.share.id, fileId: file.id, err: error }, 'Public server thumbnail generation failed');
+      if (error instanceof ThumbnailDeferredError) res.setHeader('Retry-After', String(error.retryAfter));
+      logForRequest(req)[error instanceof ThumbnailDeferredError ? 'debug' : 'warn']({ event: 'public_thumbnail_generation_failed', shareId: opened.share.id, fileId: file.id, err: error }, 'Public server thumbnail generation failed');
       throw new ShareError(422, 'A thumbnail could not be generated for this file');
     } finally {
       await fileHandle.close().catch(() => undefined);
@@ -1781,10 +1735,10 @@ export function createShareRouter(): express.Router {
 
   router.use((error: unknown, req: Request, res: Response, next: NextFunction) => {
     if (res.headersSent) { next(error); return; }
-    const statusCode = error instanceof ShareError ? error.statusCode : 500;
+    const statusCode = error instanceof ShareError || error instanceof MultipartUploadError || error instanceof StorageQuotaError ? error.statusCode : 500;
     if (statusCode >= 500) logForRequest(req).error({ event: 'share_request_failed', err: error }, 'Share request failed');
     else logForRequest(req).warn({ event: 'share_request_rejected', statusCode }, 'Share request was rejected');
-    res.status(statusCode).json({ error: statusCode >= 500 ? 'Share request failed' : error instanceof Error ? error.message : 'Share request failed' });
+    res.status(statusCode).json({ error: statusCode >= 500 && !(error instanceof StorageQuotaError) ? 'Share request failed' : error instanceof Error ? error.message : 'Share request failed' });
   });
   return router;
 }

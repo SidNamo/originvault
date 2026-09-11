@@ -32,6 +32,7 @@ import {
   thumbnailKind,
   type CachedThumbnail,
   ThumbnailRendererBusyError,
+  ThumbnailDeferredError,
 } from './thumbnails.js';
 
 export type PreviewKind = 'text' | 'subtitle' | 'image' | 'video' | 'audio' | 'pdf' | 'unsupported';
@@ -121,6 +122,10 @@ export function previewKind(name: string, mimeType = ''): PreviewKind {
   if (SUBTITLE_EXTENSIONS.has(ext)) return 'subtitle';
   if ((ext === 'ts' || ext === 'mts') && mime === 'video/mp2t') return 'video';
   if (ext === 'svgz') return 'unsupported';
+  if (mime.startsWith('audio/')) return 'audio';
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('video/')) return 'video';
+  if (mime === 'application/pdf') return 'pdf';
   if (isEditableTextFile(name, mimeType)) return 'text';
   if (IMAGE_MIME[ext] || thumbnailKind(name, mimeType) === 'image' || mime.startsWith('image/')) return 'image';
   if (VIDEO_MIME[ext] || thumbnailKind(name, mimeType) === 'video' || mime.startsWith('video/')) return 'video';
@@ -706,7 +711,8 @@ export function createFilePreviewRouter(): express.Router {
           throw new PreviewError(503, 'Image rendering is temporarily busy');
         }
         const event = identity.mode === 'thumbnail' ? 'thumbnail_generation_failed' : 'image_preview_generation_failed';
-        logForRequest(req).warn({ event, fileId: identity.id, err: error }, 'Server image derivative generation failed');
+        if (error instanceof ThumbnailDeferredError) res.setHeader('Retry-After', String(error.retryAfter));
+        logForRequest(req)[error instanceof ThumbnailDeferredError ? 'debug' : 'warn']({ event, fileId: identity.id, err: error }, 'Server image derivative generation failed');
         throw new PreviewError(422, identity.mode === 'thumbnail'
           ? 'A thumbnail could not be generated for this file'
           : 'A browser-compatible preview could not be generated for this image');

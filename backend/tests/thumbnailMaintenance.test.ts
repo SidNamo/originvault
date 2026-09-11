@@ -169,3 +169,23 @@ test('thumbnail backfill resolves nested trashed files inside the isolated root'
     /outside its trash root/,
   );
 });
+
+test('backfill counts repeated invalid content as deferred rather than rerendering every pass', async () => {
+  const storageKey = `backfill-invalid-${randomUUID()}`;
+  const directory = path.join(config.dataRoot, storageKey);
+  const source = Buffer.from(`invalid image ${storageKey}`);
+  const file: ThumbnailBackfillFile = {
+    id: randomUUID(), storageKey, name: 'broken.jpg', relativePath: 'broken.jpg', mimeType: 'image/jpeg',
+    sha256: createHash('sha256').update(source).digest('hex'), trashedAt: null, trashStoragePath: null, trashRootRelativePath: null,
+  };
+  await mkdir(directory, { recursive: true });
+  await writeFile(path.join(directory, file.name), source);
+  try {
+    const fetchPage = async (cursor: string | null) => cursor ? [] : [file];
+    assert.equal((await backfillMissingThumbnails(fetchPage)).failedThumbnails, 1);
+    const next = await backfillMissingThumbnails(fetchPage);
+    assert.equal(next.failedThumbnails, 0);
+    assert.equal(next.generatedThumbnails, 0);
+    assert.equal(next.deferredThumbnails, 1);
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});

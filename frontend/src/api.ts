@@ -984,7 +984,12 @@ export const api = {
               new Error(
                 String(result.error ?? `Chunk upload failed (${xhr.status})`),
               ),
-              { serverOffset: Number(xhr.getResponseHeader("Upload-Offset")) },
+              {
+                statusCode: xhr.status,
+                serverOffset: xhr.getResponseHeader("Upload-Offset") === null
+                  ? undefined
+                  : Number(xhr.getResponseHeader("Upload-Offset")),
+              },
             ),
           );
       });

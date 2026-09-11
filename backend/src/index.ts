@@ -3,7 +3,6 @@ import { randomUUID } from 'node:crypto';
 import { mkdir, open, rename, rm, unlink } from 'node:fs/promises';
 import { pipeline } from 'node:stream/promises';
 import bcrypt from 'bcryptjs';
-import Busboy from 'busboy';
 import cors from 'cors';
 import express from 'express';
 import type { Pool, PoolClient } from 'pg';
@@ -13,7 +12,8 @@ import { bulkOperationsRouter } from './bulkOperations.js';
 import { config, isSupportedPublicUrlProtocol } from './config.js';
 import { db, migrate } from './db.js';
 import { resumableUploadRouter } from './resumableUploads.js';
-import { extractMetadata, isHiddenResource, originalCreatedAtFromMetadata, resolveInside, safeRelativeDirectory, safeSegment, storeOriginal, userFilesRoot } from './storage.js';
+import { extractMetadata, isHiddenResource, originalCreatedAtFromMetadata, resolveInside, safeRelativeDirectory, safeSegment, storedContentType, storeOriginal, userFilesRoot } from './storage.js';
+import { MultipartUploadError, receiveMultipartFile } from './multipartUpload.js';
 import { pruneEmptyActiveFolders, removeEmptyActiveFolderPaths } from './folderCleanup.js';
 import { logForRequest, logger, logSafePath, requestLogging } from './logger.js';
 import { assertStorageAvailable, StorageQuotaError } from './quota.js';
@@ -23,9 +23,9 @@ import { filePreviewRouter } from './filePreview.js';
 import { reconcileMutationJournals } from './mutationJournal.js';
 import { createRateLimiter } from './rateLimit.js';
 import { migrateLegacyTrashStorage, purgeExpiredTrash, TrashError, trashRouter, trashSelections } from './trash.js';
-import { prepareFileThumbnail, pruneUnusedThumbnails } from './thumbnails.js';
+import { scheduleFileThumbnail, pruneUnusedThumbnails } from './thumbnails.js';
 import { backfillMissingThumbnails, type ThumbnailBackfillFile } from './thumbnailMaintenance.js';
-import { backfillOriginalCreationTimes } from './metadataMaintenance.js';
+import { backfillOriginalCreationTimes, backfillStoredContentTypes } from './metadataMaintenance.js';
 
 const app = express();
 const registrationRateLimit = createRateLimiter({ windowMs: 60 * 60 * 1_000, max: 5 });
@@ -59,6 +59,7 @@ function isAllowedBrowserOrigin(origin: string | undefined): boolean {
 }
 
 app.set('trust proxy', ['loopback', 'linklocal', 'uniquelocal']);
+app.use(requestLogging);
 app.use((req, res, next) => {
   const origin = req.header('origin');
   if (!isAllowedBrowserOrigin(origin)) {
@@ -67,12 +68,11 @@ app.use((req, res, next) => {
   }
   next();
 });
-app.use(requestLogging);
 app.use('/webdav', webdavRouter);
 app.use(cors({
   origin: (origin, callback) => callback(null, isAllowedBrowserOrigin(origin)),
   credentials: true,
-  exposedHeaders: ['ETag', 'X-Source-Encoding', 'X-Source-BOM', 'X-Content-SHA256', 'Content-Range'],
+  exposedHeaders: ['ETag', 'X-Source-Encoding', 'X-Source-BOM', 'X-Content-SHA256', 'Content-Range', 'Upload-Offset', 'Upload-Length', 'Upload-Accept', 'Location'],
 }));
 app.use(express.json({ limit: '1mb' }));
 
@@ -381,74 +381,40 @@ app.delete('/api/folders/:id', requireAuth, async (req, res) => {
   } finally { client.release(); }
 });
 
-app.post('/api/files/upload', requireAuth, (req, res, next) => {
-  let folderId: string | null = typeof req.query.folderId === 'string' ? req.query.folderId : null;
+app.post('/api/files/upload', requireAuth, async (req, res) => {
+  const folderId = typeof req.query.folderId === 'string' ? req.query.folderId : null;
   const relativeDirectory = typeof req.query.relativeDirectory === 'string' ? req.query.relativeDirectory : '';
-  let destinationFolderId = folderId;
-  let clientLastModified: Date | undefined;
-  let uploadPromise: Promise<{ stored: Awaited<ReturnType<typeof storeOriginal>>; client: PoolClient }> | undefined;
-  let originalName = '';
-  let mimeType = 'application/octet-stream';
-  try {
-    logForRequest(req).trace({ event: 'upload_request_parsing_started', folderId, relativeDirectory, maxUploadBytes: config.maxUploadBytes }, 'Multipart upload parsing started');
-    const busboy = Busboy({ headers: req.headers, limits: { fileSize: config.maxUploadBytes, files: 1, fields: 5 } });
-    busboy.on('field', (name, value) => {
-      if (name === 'folderId') folderId = value || null;
-      if (name === 'lastModified') clientLastModified = new Date(Number(value));
-    });
-    busboy.on('file', (_name, stream, info) => {
-      originalName = info.filename;
-      mimeType = info.mimeType || mimeType;
-      logForRequest(req).debug({ event: 'upload_file_stream_received', originalName, mimeType, folderId, relativeDirectory }, 'Upload file stream received');
-      stream.on('limit', () => stream.destroy(Object.assign(new Error('File is too large'), { code: 'LIMIT_FILE_SIZE' })));
-      uploadPromise = (async () => {
-        const client = await db.connect();
-        try {
-          await client.query('BEGIN');
-          await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`originvault:${req.user!.id}`]);
-          const destination = await ensureFolderPath(req.user!, folderId, relativeDirectory, client);
-          destinationFolderId = destination.folderId;
-          const stored = await storeOriginal({ storageKey: req.user!.storageKey, username: req.user!.username, folderPath: destination.relativePath, originalName, stream, clientLastModified });
-          return { stored, client };
-        } catch (error) {
-          await client.query('ROLLBACK').catch(() => undefined);
-          client.release();
-          throw error;
-        }
-      })().catch((error) => { stream.resume(); throw error; });
-      void uploadPromise.catch(() => undefined);
-    });
-    busboy.on('error', next);
-    busboy.on('finish', async () => {
-      try {
-        if (!uploadPromise) return res.status(400).json({ error: 'A file is required' });
-        const context = await uploadPromise;
-        const { stored, client } = context;
-        const metadata = await extractMetadata(stored.absolutePath);
-        let committed = false;
-        try {
-          await assertStorageAvailable(req.user!.id, BigInt(stored.size), client);
-          const result = await client.query(`INSERT INTO files(user_id, folder_id, original_name, stored_name, relative_path, mime_type, size_bytes, sha256, client_last_modified, extracted_metadata, is_hidden, original_created_at)
-            VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`, [req.user!.id, destinationFolderId, originalName, stored.storedName, stored.relativePath, mimeType, stored.size, stored.sha256, clientLastModified ?? null, metadata, isHiddenResource(stored.storedName, metadata), originalCreatedAtFromMetadata(metadata) ?? null]);
-          await prepareFileThumbnail({
-            sourcePath: stored.absolutePath,
-            sha256: stored.sha256,
-            name: stored.storedName,
-            mimeType,
-          });
-          await client.query('COMMIT');
-          committed = true;
-          logForRequest(req).info({ event: 'upload_completed', fileId: result.rows[0].id, folderId: destinationFolderId, originalName, storedName: stored.storedName, relativePath: stored.relativePath, mimeType, sizeBytes: stored.size, sha256: stored.sha256, metadataFieldCount: Object.keys(metadata).length }, 'Original upload stored and indexed');
-          return res.status(201).json({ id: result.rows[0].id, name: originalName, sizeBytes: String(stored.size), sha256: stored.sha256 });
-        } catch (error) {
-          await client.query('ROLLBACK').catch(() => undefined);
-          if (!committed) await unlink(stored.absolutePath).catch(() => undefined);
-          throw error;
-        } finally { client.release(); }
-      } catch (error) { next(error); }
-    });
-    req.pipe(busboy);
-  } catch (error) { next(error); }
+  const uploaded = await receiveMultipartFile(req, config.maxUploadBytes, async (file, fields, parsed) => {
+    const client = await db.connect();
+    let stored: Awaited<ReturnType<typeof storeOriginal>> | undefined;
+    let committed = false;
+    try {
+      const destinationId = folderId ?? fields.folderId ?? null;
+      if (destinationId && !UUID_PATTERN.test(destinationId)) throw new MultipartUploadError(400, 'folderId is invalid');
+      const clientLastModified = fields.lastModified ? new Date(Number(fields.lastModified)) : undefined;
+      if (clientLastModified && !Number.isFinite(clientLastModified.getTime())) throw new MultipartUploadError(400, 'lastModified is invalid');
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`originvault:${req.user!.id}`]);
+      const destination = await ensureFolderPath(req.user!, destinationId, relativeDirectory, client);
+      stored = await storeOriginal({ storageKey: req.user!.storageKey, username: req.user!.username, folderPath: destination.relativePath, originalName: file.name, stream: file.stream, clientLastModified });
+      await parsed;
+      const metadata = await extractMetadata(stored.absolutePath);
+      const mimeType = storedContentType(file.mimeType, metadata);
+      await assertStorageAvailable(req.user!.id, BigInt(stored.size), client);
+      const result = await client.query(`INSERT INTO files(user_id, folder_id, original_name, stored_name, relative_path, mime_type, size_bytes, sha256, client_last_modified, extracted_metadata, is_hidden, original_created_at)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`, [req.user!.id, destination.folderId, file.name, stored.storedName, stored.relativePath, mimeType, stored.size, stored.sha256, clientLastModified ?? null, metadata, isHiddenResource(stored.storedName, metadata), originalCreatedAtFromMetadata(metadata) ?? null]);
+      await client.query('COMMIT');
+      committed = true;
+      scheduleFileThumbnail({ sourcePath: stored.absolutePath, sha256: stored.sha256, name: stored.storedName, mimeType });
+      logForRequest(req).info({ event: 'upload_completed', fileId: result.rows[0].id, folderId: destination.folderId, originalName: file.name, storedName: stored.storedName, relativePath: stored.relativePath, mimeType, sizeBytes: stored.size, sha256: stored.sha256 }, 'Original upload stored and indexed');
+      return { id: result.rows[0].id, name: file.name, sizeBytes: String(stored.size), sha256: stored.sha256 };
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      if (stored && !committed) await unlink(stored.absolutePath).catch(() => undefined);
+      throw error;
+    } finally { client.release(); }
+  });
+  res.status(201).json(uploaded);
 });
 
 app.get('/api/files/:id', requireAuth, async (req, res) => {
@@ -574,12 +540,15 @@ app.delete('/api/files/:id', requireAuth, async (req, res) => {
 });
 
 app.use((error: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-  logger.error({ event: 'unhandled_request_error', requestId: _req.requestId, userId: _req.user?.id, method: _req.method, path: logSafePath(_req.path), err: error }, 'Unhandled request error');
+  const statusCode = error instanceof MultipartUploadError || error instanceof StorageQuotaError
+    ? error.statusCode : error?.code === 'LIMIT_FILE_SIZE' ? 413 : 500;
+  logger[statusCode >= 500 && statusCode !== 507 ? 'error' : 'warn']({ event: 'request_failed', requestId: _req.requestId, userId: _req.user?.id, method: _req.method, path: logSafePath(_req.path), statusCode, err: error }, 'Request failed');
   if (res.headersSent) {
     if (!res.destroyed) res.destroy(error instanceof Error ? error : undefined);
     return;
   }
   if (error?.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: 'File is too large' });
+  if (error instanceof MultipartUploadError) return res.status(error.statusCode).json({ error: error.message });
   if (error instanceof StorageQuotaError) return res.status(507).json({ error: error.message });
   return res.status(500).json({ error: 'Internal server error' });
 });
@@ -615,7 +584,7 @@ async function backfillThumbnailCache(): Promise<void> {
       ...result,
       durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000,
     };
-    if (result.generatedThumbnails || result.unavailableFiles || result.failedThumbnails)
+    if (result.generatedThumbnails || result.unavailableFiles || result.failedThumbnails || result.deferredThumbnails)
       logger.info(details, 'Existing file thumbnail backfill completed');
     else
       logger.debug(details, 'Existing file thumbnail backfill found no missing thumbnails');
@@ -683,8 +652,10 @@ async function start(): Promise<void> {
     throw new Error('Another OriginVault backend instance is already using this database');
   }
   await migrate();
-  await backfillOriginalCreationTimes();
+  // Journal recovery compares row versions; metadata repair must run afterwards.
   await reconcileMutationJournals();
+  await backfillStoredContentTypes();
+  await backfillOriginalCreationTimes();
   await migrateLegacyTrashStorage();
   await purgeExpiredTrash();
   await purgeUnusedThumbnailCache();
@@ -694,10 +665,19 @@ async function start(): Promise<void> {
   thumbnailMaintenanceTimer.unref();
   const server = app.listen(config.port, () => logger.info({ event: 'service_ready', port: config.port }, 'OriginVault backend is ready'));
   void runThumbnailMaintenance(false);
-  // Node's default five-minute limit cuts off valid multi-gigabyte WebDAV uploads.
-  const largeRequestTimeoutMs = 30 * 60 * 1_000;
-  server.requestTimeout = largeRequestTimeoutMs;
-  server.setTimeout(largeRequestTimeoutMs);
+  // Bound inactivity rather than total transfer time for slow multi-gigabyte uploads.
+  server.requestTimeout = 0;
+  server.setTimeout(60 * 60 * 1_000, (socket) => {
+    logger.warn({ event: 'http_connection_timeout', remoteAddress: socket.remoteAddress }, 'HTTP connection exceeded the inactivity limit');
+    socket.destroy();
+  });
+  server.on('clientError', (error, socket) => {
+    const code = (error as NodeJS.ErrnoException).code;
+    logger.warn({ event: 'http_client_error', code, remoteAddress: 'remoteAddress' in socket ? socket.remoteAddress : undefined, message: error.message }, 'HTTP request failed before routing');
+    if (code === 'ECONNRESET' || !socket.writable) { socket.destroy(); return; }
+    const status = code === 'HPE_HEADER_OVERFLOW' ? '431 Request Header Fields Too Large' : '400 Bad Request';
+    socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+  });
   const shutdown = (signal: string) => {
     logger.warn({ event: 'service_shutdown_started', signal }, 'OriginVault backend shutdown started');
     server.close(async (error) => {

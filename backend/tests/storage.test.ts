@@ -25,6 +25,18 @@ test('safe path and exact bytes survive storage', async () => {
     ]);
     assert.notEqual(firstConcurrent.storedName, secondConcurrent.storedName);
     assert.deepEqual(new Set([await readFile(firstConcurrent.absolutePath, 'utf8'), await readFile(secondConcurrent.absolutePath, 'utf8')]), new Set(['first', 'second']));
+    for (const originalName of [`${'가旅🙂'.repeat(40)}.jpg`, `${'a'.repeat(251)}.jpg`]) {
+      const options = { storageKey: 'tester', username: 'tester', folderPath: 'long', originalName };
+      const first = await storeOriginal({ ...options, stream: Readable.from(original) });
+      const second = await storeOriginal({ ...options, stream: Readable.from(original) });
+      assert.ok(Buffer.byteLength(first.storedName) <= 255);
+      assert.ok(Buffer.byteLength(second.storedName) <= 255);
+      assert.match(first.storedName, /\.jpg$/);
+      assert.match(second.storedName, / \(1\)\.jpg$/);
+      assert.equal(first.storedName.includes('\ufffd'), false);
+      assert.deepEqual(await readFile(second.absolutePath), original);
+      assert.equal(second.sha256, expectedHash);
+    }
     assert.throws(() => resolveInside(temp, '../../etc/passwd'));
     assert.equal(safeSegment('../photo?.jpg'), 'photo_.jpg');
     assert.equal(safeRelativeDirectory('여행/2026/원본'), '여행/2026/원본');

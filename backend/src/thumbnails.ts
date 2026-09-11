@@ -6,12 +6,14 @@ import {
   mkdir,
   mkdtemp,
   open,
+  readFile,
   readdir,
   rename,
   rm,
   stat,
   unlink,
   utimes,
+  writeFile,
   type FileHandle,
 } from 'node:fs/promises';
 import path from 'node:path';
@@ -47,6 +49,8 @@ const MAX_RENDERER_ERROR_BYTES = 64 * 1024;
 const UNUSED_THUMBNAIL_GRACE_MS = 24 * 60 * 60 * 1_000;
 const MAX_CONCURRENT_DERIVATIVE_RENDERS = 2;
 const MAX_QUEUED_DERIVATIVE_RENDERS = 32;
+const FAILURE_POLICY_VERSION = 1;
+const FAILURE_RETRY_MS = 24 * 60 * 60 * 1_000;
 
 const SHARP_IMAGE_EXTENSIONS = new Set([
   'jpg', 'jpeg', 'jpe', 'jfif', 'pjpeg', 'png', 'apng', 'gif', 'webp', 'avif', 'tif', 'tiff',
@@ -169,6 +173,54 @@ export class ThumbnailGenerationError extends Error {
   }
 }
 
+export class ThumbnailDeferredError extends ThumbnailGenerationError {
+  constructor(readonly reason: string, readonly retryAt: number) {
+    super(`Thumbnail retry deferred: ${reason}`);
+  }
+
+  get retryAfter(): number { return Math.max(1, Math.ceil((this.retryAt - Date.now()) / 1_000)); }
+}
+
+export function thumbnailFailureReason(error: unknown): string | undefined {
+  if (error instanceof ThumbnailDeferredError) return error.reason;
+  if (!(error instanceof ThumbnailGenerationError) || error.code === 'ENOENT' || error.code === 'ESTALE') return undefined;
+  if (error.code === 'ENOTMEDIA') return 'unsupported_media';
+  if (/matches no streams/i.test(error.message)) return 'no_video_stream';
+  if (/incorrect password|password required/i.test(error.message)) return 'encrypted_pdf';
+  if (/ImageTypeNotSupported|unsupported image format|no decode delegate/i.test(error.message)) return 'unsupported_image';
+  if (/moov atom not found|Invalid data found|corrupt header|premature end|empty file/i.test(error.message)) return 'invalid_media';
+  if (/timed out|timeout/i.test(error.message)) return 'renderer_timeout';
+  if (/renderer.*(failed|could not start)|ImageMagick.*(failed|could not start)/i.test(error.message)) return 'renderer_failed';
+  return undefined;
+}
+
+type ThumbnailFailure = { version: number; reason: string; retryAt: number };
+
+async function previousThumbnailFailure(targetPath: string): Promise<ThumbnailFailure | undefined> {
+  try {
+    const failure = JSON.parse(await readFile(`${targetPath}.failure.json`, 'utf8')) as ThumbnailFailure;
+    if (failure.version === FAILURE_POLICY_VERSION && typeof failure.reason === 'string'
+      && Number.isFinite(failure.retryAt) && failure.retryAt > Date.now()) return failure;
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') logger.debug({ event: 'thumbnail_failure_record_unreadable', err: error }, 'Thumbnail failure record will be retried');
+  }
+  return undefined;
+}
+
+async function rememberThumbnailFailure(targetPath: string, reason: string): Promise<void> {
+  const temporaryPath = `${targetPath}.${process.pid}-${randomUUID()}.tmp`;
+  try {
+    await mkdir(path.dirname(targetPath), { recursive: true, mode: 0o700 });
+    const retryMs = reason.startsWith('renderer_') ? 60 * 60 * 1_000 : FAILURE_RETRY_MS;
+    await writeFile(temporaryPath, JSON.stringify({ version: FAILURE_POLICY_VERSION, reason, retryAt: Date.now() + retryMs }), { flag: 'wx', mode: 0o600 });
+    await rename(temporaryPath, `${targetPath}.failure.json`);
+  } catch (error) {
+    logger.warn({ event: 'thumbnail_failure_record_write_failed', err: error }, 'Thumbnail retry state could not be saved');
+  } finally {
+    await rm(temporaryPath, { force: true }).catch(() => undefined);
+  }
+}
+
 function imageExtension(name: string): string {
   return path.extname(name).slice(1).toLowerCase();
 }
@@ -183,8 +235,32 @@ function isSvg(name: string, mimeType = ''): boolean {
 }
 
 function magickCoder(name: string, mimeType = ''): string | undefined {
-  return MAGICK_CODERS_BY_EXTENSION[imageExtension(name)]
-    ?? MAGICK_CODERS_BY_MIME[normalizedMime(mimeType)];
+  return MAGICK_CODERS_BY_MIME[normalizedMime(mimeType)]
+    ?? MAGICK_CODERS_BY_EXTENSION[imageExtension(name)];
+}
+
+async function sourceImageCoder(source: FileHandle, name: string, mimeType = ''): Promise<string | undefined> {
+  const header = Buffer.alloc(64);
+  const { bytesRead } = await source.read(header, 0, header.length, 0);
+  const bytes = header.subarray(0, bytesRead);
+  if (bytes.length >= 4 && bytes.readUInt32BE(0) === 0x00051607)
+    throw new ThumbnailGenerationError('AppleDouble resource fork has no image pixels', { code: 'ENOTMEDIA' });
+  // Prefer byte signatures over stale or client-supplied names and MIME types.
+  if (bytes.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))
+    || bytes.subarray(0, 8).equals(Buffer.from('89504e470d0a1a0a', 'hex'))
+    || /^GIF8[79]a/.test(bytes.toString('ascii', 0, 6))
+    || (bytes.toString('ascii', 0, 4) === 'RIFF' && bytes.toString('ascii', 8, 12) === 'WEBP')) return undefined;
+  if (bytes.toString('ascii', 4, 8) === 'ftyp') {
+    const brands = bytes.toString('ascii', 8);
+    if (/avif|avis/.test(brands)) return undefined;
+    if (/heic|heix|hevc|hevx|heim|heis|mif1|msf1/.test(brands)) return 'HEIC';
+  }
+  if (bytes.subarray(0, 2).equals(Buffer.from([0xff, 0x0a]))
+    || bytes.subarray(0, 12).equals(Buffer.from('0000000c4a584c200d0a870a', 'hex'))) return 'JXL';
+  if (/^(49492a00|4d4d002a|49492b00|4d4d002b)$/.test(bytes.subarray(0, 4).toString('hex')))
+    return magickCoder(name, mimeType) === 'DNG' ? 'DNG' : undefined;
+  if (bytes.toString('ascii', 0, 2) === 'BM') return 'BMP';
+  return magickCoder(name, mimeType);
 }
 
 function videoDemuxer(name: string, mimeType = ''): string | undefined {
@@ -198,9 +274,13 @@ export function thumbnailKind(name: string, mimeType = ''): ThumbnailKind | unde
   const extension = imageExtension(name);
   const mime = normalizedMime(mimeType);
   if (isSvg(name, mimeType)) return undefined;
-  if (IMAGE_EXTENSIONS.has(extension) || MAGICK_CODERS_BY_MIME[mime] || mime.startsWith('image/')) return 'image';
-  if (videoDemuxer(name, mimeType) || mime.startsWith('video/')) return 'video';
-  if (extension === 'pdf' || mime === 'application/pdf') return 'pdf';
+  if (mime.startsWith('audio/')) return undefined;
+  if (mime.startsWith('image/')) return 'image';
+  if (mime.startsWith('video/')) return 'video';
+  if (mime === 'application/pdf') return 'pdf';
+  if (IMAGE_EXTENSIONS.has(extension) || MAGICK_CODERS_BY_MIME[mime]) return 'image';
+  if (videoDemuxer(name, mimeType)) return 'video';
+  if (extension === 'pdf') return 'pdf';
   return undefined;
 }
 
@@ -346,7 +426,7 @@ async function renderStreamedProcess(options: {
     const [inputResult, outputResult, exitResult] = await Promise.allSettled([input, output, exited]);
     if (timedOut) throw new ThumbnailGenerationError(`${options.errorLabel} timed out`);
     if (exitResult.status === 'rejected')
-      throw new ThumbnailGenerationError(`${options.errorLabel} could not start`, { cause: exitResult.reason });
+      throw new ThumbnailGenerationError(`${options.errorLabel} could not start`, { cause: exitResult.reason, code: 'ERENDERER' });
     if (inputResult.status === 'rejected' && !isExpectedPipeClosure(inputResult.reason)) throw inputResult.reason;
     if (outputResult.status === 'rejected') throw outputResult.reason;
     if (exitResult.value.code !== 0) {
@@ -386,10 +466,7 @@ function renderPdfFirstPage(sourceHandle: FileHandle, targetPath: string): Promi
 function renderVideoThumbnail(
   sourceHandle: FileHandle,
   targetPath: string,
-  name: string,
-  mimeType = '',
 ): Promise<void> {
-  const demuxer = videoDemuxer(name, mimeType);
   return renderStreamedProcess({
     command: 'ffmpeg',
     args: [
@@ -403,7 +480,6 @@ function renderVideoThumbnail(
       '-format_whitelist', VIDEO_FORMAT_WHITELIST,
       '-probesize', '20971520',
       '-analyzeduration', '10000000',
-      ...(demuxer ? ['-f', demuxer] : []),
       '-i', '/proc/self/fd/0',
       '-map', '0:v:0',
       '-an',
@@ -483,10 +559,11 @@ async function renderWithSharp(
   targetPath: string,
   edge: number,
   quality: number,
+  tolerateTruncatedJpeg = false,
 ): Promise<void> {
   const transformer = sharp({
     animated: false,
-    failOn: 'error',
+    failOn: tolerateTruncatedJpeg ? 'none' : 'error',
     limitInputPixels: MAX_IMAGE_PIXELS,
     pages: 1,
     sequentialRead: true,
@@ -547,13 +624,23 @@ async function createDerivative(
       if (kind === 'pdf') {
         await renderPdfFirstPage(sourceHandle, temporaryPath);
       } else if (kind === 'video') {
-        await renderVideoThumbnail(sourceHandle, temporaryPath, input.name, input.mimeType);
+        await renderVideoThumbnail(sourceHandle, temporaryPath);
       } else {
         const edge = derivative === 'preview' ? IMAGE_PREVIEW_EDGE : THUMBNAIL_EDGE;
         const quality = derivative === 'preview' ? 88 : 82;
-        const coder = magickCoder(input.name, input.mimeType);
+        const coder = await sourceImageCoder(sourceHandle, input.name, input.mimeType);
         if (coder) await renderWithImageMagick(sourceHandle, temporaryPath, coder, edge, quality);
-        else await renderWithSharp(sourceHandle, temporaryPath, edge, quality);
+        else {
+          try {
+            await renderWithSharp(sourceHandle, temporaryPath, edge, quality);
+          } catch (error) {
+            // Some truncated JPEGs still contain decodable pixels. Only relax that
+            // decoder warning; retain all resource limits and preserve the original.
+            if (!(error instanceof Error) || !/VipsJpeg: premature end/.test(error.message)) throw error;
+            await rm(temporaryPath, { force: true });
+            await renderWithSharp(sourceHandle, temporaryPath, edge, quality, true);
+          }
+        }
       }
       if (!(await isUsableThumbnail(temporaryPath)))
         throw new ThumbnailGenerationError('Thumbnail renderer produced an empty file');
@@ -592,7 +679,19 @@ async function getOrCreateDerivative(
     return pending.promise;
   }
   const job: ThumbnailRenderJob = { priority };
-  const creation = createDerivative(input, target, kind, derivative, job)
+  const creation = (async () => {
+    const failure = await previousThumbnailFailure(target.path);
+    if (failure) throw new ThumbnailDeferredError(failure.reason, failure.retryAt);
+    try {
+      const result = await createDerivative(input, target, kind, derivative, job);
+      await rm(`${target.path}.failure.json`, { force: true }).catch(() => undefined);
+      return result;
+    } catch (error) {
+      const reason = thumbnailFailureReason(error);
+      if (reason) await rememberThumbnailFailure(target.path, reason);
+      throw error;
+    }
+  })()
     .finally(() => {
       if (pendingThumbnails.get(key)?.promise === creation) pendingThumbnails.delete(key);
     });
@@ -621,13 +720,23 @@ export async function prepareFileThumbnail(input: DerivativeInput): Promise<void
   try {
     await getOrCreateThumbnail({ ...input, priority: 'background' });
   } catch (error) {
-    logger.warn({
+    const deferred = error instanceof ThumbnailDeferredError || error instanceof ThumbnailRendererBusyError;
+    logger[deferred ? 'debug' : 'warn']({
       event: 'thumbnail_preparation_failed',
       sha256: input.sha256,
       name: input.name,
+      mimeType: input.mimeType,
+      reason: thumbnailFailureReason(error),
       err: error,
     }, 'Server thumbnail could not be prepared; it can be retried when requested');
   }
+}
+
+export function scheduleFileThumbnail(input: DerivativeInput): void {
+  // Upload acknowledgement and user mutation locks must not wait for rendering.
+  // A moved/replaced path is verified before it can populate a content-hash cache.
+  void prepareFileThumbnail({ ...input, verifySourceHash: true }).catch((error) =>
+    logger.warn({ event: 'thumbnail_scheduling_failed', err: error }, 'Thumbnail preparation could not be scheduled'));
 }
 
 async function cacheDirectoryEntries(directory: string) {
@@ -660,11 +769,11 @@ export async function pruneUnusedThumbnails(
       const shardPath = path.join(versionPath, shard.name);
       for (const entry of await cacheDirectoryEntries(shardPath)) {
         if (!entry.isFile()) continue;
-        const match = entry.name.match(/^([a-f\d]{64})(?:\.(?:preview|video))?\.(?:webp|jpg)(\.[^.]+\.tmp)?$/i);
+        const match = entry.name.match(/^([a-f\d]{64})(?:\.(?:preview|video))?\.(?:webp|jpg)(\.[^.]+\.tmp|\.failure\.json)?$/i);
         if (!match?.[1]) continue;
         scannedFiles += 1;
         const sha256 = match[1].toLowerCase();
-        const isTemporary = Boolean(match[2]);
+        const isTemporary = Boolean(match[2]?.endsWith('.tmp'));
         if (
           version.name === THUMBNAIL_VERSION &&
           !isTemporary &&

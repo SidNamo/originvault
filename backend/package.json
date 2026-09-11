@@ -8,7 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "test": "node --import tsx --import ./tests/setup.ts --test tests/*.test.ts",
-    "test:integration": "node --import tsx --import ./tests/setup.ts --test tests/webdav.integration.test.ts"
+    "test:integration": "node --import tsx --import ./tests/setup.ts --test tests/*.integration.test.ts"
   },
   "dependencies": {
     "archiver": "^8.0.0",

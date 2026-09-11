@@ -141,11 +141,13 @@ export function requestLogging(req: Request, res: Response, next: NextFunction):
   const incomingId = req.header('x-request-id');
   req.requestId = incomingId && /^[a-zA-Z0-9._-]{1,100}$/.test(incomingId) ? incomingId : randomUUID();
   req.requestStartedAt = process.hrtime.bigint();
+  const requestPath = logSafePath((req.originalUrl || req.url).split('?', 1)[0]!);
   res.setHeader('X-Request-ID', req.requestId);
-  logger.trace({
+  logger.debug({
     event: 'http_request_received', requestId: req.requestId, method: req.method,
-    path: logSafePath(req.path), queryKeys: Object.keys(req.query), ip: req.ip,
+    path: requestPath, queryKeys: Object.keys(req.query), ip: req.ip,
     contentType: req.header('content-type'), contentLength: req.header('content-length'),
+    transferEncoding: req.header('transfer-encoding'), expect: req.header('expect'),
     userAgent: req.header('user-agent'),
   }, 'HTTP request received');
 
@@ -153,13 +155,16 @@ export function requestLogging(req: Request, res: Response, next: NextFunction):
   res.on('finish', () => {
     completed = true;
     const durationMs = req.requestStartedAt ? Number(process.hrtime.bigint() - req.requestStartedAt) / 1_000_000 : undefined;
-    const fields = { event: 'http_request_completed', requestId: req.requestId, userId: req.user?.id, username: req.user?.username, method: req.method, path: logSafePath(req.path), statusCode: res.statusCode, durationMs };
+    const fields = { event: 'http_request_completed', requestId: req.requestId, userId: req.user?.id, username: req.user?.username, method: req.method, path: requestPath, statusCode: res.statusCode, durationMs };
     if (res.statusCode >= 500) logger.error(fields, 'HTTP request completed with server error');
     else if (res.statusCode >= 400) logger.warn(fields, 'HTTP request completed with client error');
     else logger.info(fields, 'HTTP request completed');
   });
   res.on('close', () => {
-    if (!completed) logger.warn({ event: 'http_request_aborted', requestId: req.requestId, method: req.method, path: logSafePath(req.path) }, 'HTTP connection closed before response completed');
+    if (!completed) logger.warn({ event: 'http_request_aborted', requestId: req.requestId, method: req.method, path: requestPath,
+      requestComplete: req.complete, requestAborted: req.aborted, headersSent: res.headersSent,
+      durationMs: req.requestStartedAt ? Number(process.hrtime.bigint() - req.requestStartedAt) / 1_000_000 : undefined,
+    }, 'HTTP connection closed before response completed');
   });
   next();
 }

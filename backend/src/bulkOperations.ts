@@ -9,7 +9,7 @@ import { requireAuth } from './auth.js';
 import { db } from './db.js';
 import { logForRequest } from './logger.js';
 import { assertStorageAvailable, StorageQuotaError } from './quota.js';
-import { resolveInside, safeSegment, userFilesRoot } from './storage.js';
+import { fileNameCandidate, resolveInside, safeSegment, userFilesRoot } from './storage.js';
 import { moveSelectionsToTrash } from './trash.js';
 import { pruneEmptyActiveFolders, removeEmptyActiveFolderPaths } from './folderCleanup.js';
 
@@ -297,29 +297,7 @@ function reserveArchiveFileName(requestedName: string, reserved: Set<string>): s
 /** Produces the same suffix style as uploads while keeping copied names storage-safe. */
 export function copyNameCandidate(requestedName: string, index: number, kind: 'file' | 'folder'): string {
   if (!Number.isInteger(index) || index < 0) throw new Error('Copy name index must be a non-negative integer');
-  const safeName = safeSegment(requestedName);
-  const suffix = index === 0 ? '' : ` (${index})`;
-  const truncateUtf8 = (value: string, maximumBytes: number): string => {
-    let result = '';
-    let bytes = 0;
-    for (const character of value) {
-      const characterBytes = Buffer.byteLength(character);
-      if (bytes + characterBytes > maximumBytes) break;
-      result += character;
-      bytes += characterBytes;
-    }
-    return result;
-  };
-  const suffixBytes = Buffer.byteLength(suffix);
-  if (kind === 'folder') return `${truncateUtf8(safeName, 255 - suffixBytes)}${suffix}`;
-
-  const extension = path.posix.extname(safeName);
-  const stem = extension ? safeName.slice(0, -extension.length) : safeName;
-  const extensionBytes = Buffer.byteLength(extension);
-  if (extensionBytes + suffixBytes >= 255) {
-    return `${truncateUtf8(safeName, 255 - suffixBytes)}${suffix}`;
-  }
-  return `${truncateUtf8(stem, 255 - extensionBytes - suffixBytes)}${suffix}${extension}`;
+  return fileNameCandidate(requestedName, index, kind);
 }
 
 export function copyDisplayNameCandidate(requestedName: string, index: number): string {

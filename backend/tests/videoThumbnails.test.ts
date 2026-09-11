@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import test from 'node:test';
 import sharp from 'sharp';
 import { config } from '../src/config.js';
-import { getOrCreateThumbnail, hasCachedThumbnail, pruneUnusedThumbnails, thumbnailKind } from '../src/thumbnails.js';
+import { getOrCreateThumbnail, hasCachedThumbnail, pruneUnusedThumbnails, ThumbnailDeferredError, thumbnailFailureReason, thumbnailKind } from '../src/thumbnails.js';
 import { backfillMissingThumbnails, type ThumbnailBackfillFile } from '../src/thumbnailMaintenance.js';
 
 const execFileAsync = promisify(execFile);
@@ -20,6 +20,38 @@ test('video classification includes generic uploads without treating TypeScript 
   assert.equal(thumbnailKind('clip.ts', 'video/mp2t'), 'video');
   assert.equal(thumbnailKind('clip.mts', 'video/mp2t'), 'video');
   assert.equal(thumbnailKind('audio.ogg', 'application/ogg'), undefined);
+  assert.equal(thumbnailKind('audio.mp4', 'audio/mp4'), undefined);
+});
+
+test('video format detection handles renamed containers and defers audio-only failures', async () => {
+  const storageKey = `video-formats-${randomUUID()}`;
+  const directory = path.join(config.dataRoot, storageKey);
+  await mkdir(directory, { recursive: true });
+  try {
+    const sourcePath = path.join(directory, 'renamed.mp4');
+    await execFileAsync('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=64x48:rate=10',
+      '-t', '0.2', '-c:v', 'libx264', '-threads', '1', '-f', 'matroska', sourcePath,
+    ]);
+    const bytes = await readFile(sourcePath);
+    const thumbnail = await getOrCreateThumbnail({ sourcePath, sha256: createHash('sha256').update(bytes).digest('hex'), name: 'renamed.mp4', mimeType: 'video/mp4' });
+    assert.ok(thumbnail);
+    assert.equal((await sharp(thumbnail.path).metadata()).format, 'jpeg');
+    const audioPath = path.join(directory, 'audio.mp4');
+    await execFileAsync('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-f', 'lavfi', '-i', 'sine=frequency=440',
+      '-t', '0.2', '-c:a', 'aac', audioPath,
+    ]);
+    const audio = await readFile(audioPath);
+    const input = { sourcePath: audioPath, sha256: createHash('sha256').update(audio).digest('hex'), name: 'audio.mp4', mimeType: 'video/mp4' };
+    await assert.rejects(getOrCreateThumbnail(input), (error) => thumbnailFailureReason(error) === 'no_video_stream');
+    await assert.rejects(getOrCreateThumbnail(input), (error) => error instanceof ThumbnailDeferredError && error.reason === 'no_video_stream');
+    assert.equal(await hasCachedThumbnail(input), false);
+    assert.deepEqual(await readFile(audioPath), audio);
+  } finally {
+    await pruneUnusedThumbnails(new Set(), { minimumAgeMs: 0, now: Date.now() + 1_000 });
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test('video posters use seekable snapshots, correct aspect ratio, cache reuse, backfill and pruning', async () => {

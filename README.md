@@ -103,10 +103,24 @@ backend는 시작 후 기존 활성·휴지통 파일의 누락 썸네일을 비
 6시간마다 누락 썸네일 백필을 먼저 실행하고 캐시를 정리합니다. 어떤 활성·휴지통
 파일에서도 참조하지 않고 마지막 생성·재사용 후 24시간이 지난 캐시만 삭제합니다.
 동영상은 FFmpeg로 최대 512px 대표 프레임을 추출해 `<sha256>.video.jpg`로 저장합니다.
-일반·resumable·공개 공유·WebDAV 업로드에서 미리 생성하며, 캐시가 없는 동영상은
+일반·resumable·공개 공유·WebDAV 업로드 완료 후 백그라운드에서 생성하며, 캐시가 없는 동영상은
 목록 요청 시 생성한 뒤 이미지를 응답합니다. 보이는 항목의 요청은 백필 대기 작업보다
 우선 처리하고, 같은 파일의 백필이 이미 대기 중이면 그 작업의 우선순위를 올립니다.
 이미 실행 중인 렌더링은 완료 후 다음 작업을 시작합니다.
+
+업로드 성공 응답은 원본 저장과 DB 색인이 완료되면 반환하며, 썸네일 대기열이나
+변환 시간을 기다리지 않습니다. 백그라운드 생성은 원본 SHA-256을 검증하므로 이후
+덮어쓴 파일의 썸네일이 이전 해시로 저장되지 않습니다. 이미지의 주요 바이트 서명을
+확인하고 영상 컨테이너를 자동 판별하여 잘못된 확장자로 인한 변환 실패를 줄입니다.
+업로드 MIME은 ExifTool의 판별 결과를 우선하고, 기존 색인의 MIME도 시작 시 저장된
+추출 메타데이터로 보완합니다.
+
+암호화 PDF, 영상 스트림 없는 파일, 지원 불가·손상 미디어의 변환 실패는 캐시 옆
+`*.failure.json`에 이유와 다음 재시도 시각을 기록합니다. 같은 해시는 24시간 뒤 재시도하며
+렌더러 실행 실패·시간 초과는 1시간 뒤 재시도합니다. 대기 중에는 원본을 반복해서
+읽거나 같은 WARN을 출력하지 않고 `deferredThumbnails`로 집계합니다. 새 바이트의
+새 해시는 즉시 다시 시도할 수 있으며, 참조가 사라진 실패 기록도 캐시 정리 대상입니다.
+복구 가능한 JPEG 잘림은 미리보기 생성만 허용하고 원본 바이트는 유지합니다.
 
 일반·공개 공유·휴지통 목록의 이미지·동영상·PDF는 같은 이미지 로딩 경로를 사용합니다.
 화면 근처에서만 불러오고, 벗어나면 전송을 중단하며, 다시 들어오면 HTTP Range로
@@ -157,10 +171,50 @@ curl --fail "${PUBLIC_URL}/api/health"
 health endpoint는 `200`을 반환해야 합니다. 인증 업로드, 공개 공유 링크, NPM HTTPS
 접속을 확인하면 인증·저장소·프록시 변경 후의 핵심 경로를 검증할 수 있습니다.
 
+### WebDAV 업로드 연결 문제 조사
+
+WebDAV 주소는 `PUBLIC_URL` 뒤에 `/webdav/`를 붙인 주소이며, WebDAV 토큰을 비밀번호로
+사용합니다. 파일 업로드 요청은 `PUT`, 폴더 조회는 `PROPFIND`입니다. `PROPFIND 207`만
+보이면 조회는 수행된 것이지만 업로드 시도·성공까지 확인된 것은 아닙니다.
+
+```sh
+docker compose logs -f frontend backend
+```
+
+`LOG_LEVEL=debug`로 재생성한 backend는 요청 도착 즉시 `http_request_received`를
+기록하고, 완료·중단 로그에 `/webdav/`를 포함한 전체 경로를 유지합니다. HTTP 파서에서
+라우팅 전 거부된 요청은 `http_client_error`, 유휴 연결 제한은 `http_connection_timeout`으로
+남깁니다. frontend는 WebDAV 요청과 HTTP 4xx·5xx를 `proxy_request_completed`로 출력하며
+backend와 같은 `requestId`, 응답 코드와 `upstreamStatus`를 비교할 수 있습니다.
+공유 토큰과 쿼리 문자열은 프록시 접근 로그에서 제외합니다.
+
+frontend 로그에 PUT가 없으면 NPM 접근 로그와 클라이언트 로그를 확인합니다. NPM에서
+이미 요청을 거부했다면 frontend/backend에는 기록되지 않습니다. NPM의 해당 Proxy Host에도
+파일 크기 제한과 장시간 업로드 허용 설정을 맞춥니다. 예를 들어 Advanced 설정에서:
+
+```nginx
+client_max_body_size 0;
+client_body_timeout 3600s;
+proxy_read_timeout 3600s;
+proxy_send_timeout 3600s;
+proxy_request_buffering off;
+```
+
+최종 파일 크기·quota 제한은 backend에서 적용합니다. backend는 전체 전송 시간 대신
+1시간의 유휴 연결 제한을 사용하고, 스트리밍 크기 초과는 413, quota 초과는 507로 응답합니다.
+
+Android Autosync의 `WRONG_CONNECTION`은 서버가 반환하는 HTTP 코드가 아닙니다.
+PUT 도착 기록이 없으면 앱의 자동 동기화 연결 조건(Wi-Fi/모바일 데이터 등)을 확인하고
+수동 동기화 결과와 비교합니다. [Autosync 가이드](https://metactrl.com/autosync/userguide/)는
+수동 동기화가 네트워크·배터리 조건을 검사하지 않는다고 설명합니다. 정확한 실패 지점은
+앱 Settings → Support → Enable logging 후 재현하고 Send Log File로 내보낸 로그에서 확인합니다.
+[공식 로그 수집 안내](https://metactrl.com/faq/)
+
 ## 로컬 검증
 
-Backend 테스트에는 Node.js 24, FFmpeg(`libx264`/`mjpeg` 포함), ExifTool이 필요합니다.
-이미지/PDF 실제 변환에는 배포 Dockerfile의 ImageMagick 모듈과 Poppler도 설치합니다.
+Backend 테스트에는 Node.js 24, FFmpeg(`libx264`/`mjpeg`/`aac` 포함), ExifTool,
+ImageMagick의 HEIC 읽기·쓰기 및 WebP 모듈, Poppler가 필요합니다. Alpine 3.24에서는
+HEIC 테스트 fixture 생성에 `libheif-x265`도 설치합니다.
 
 ```sh
 (cd backend && npm ci && npm run build && npm test)
@@ -174,6 +228,10 @@ PostgreSQL 서버에는 `pgcrypto` 확장이 설치되어 있어야 합니다.
 ```sh
 (cd backend && ORIGINVAULT_TEST_DATABASE_URL='postgresql://tester:password@127.0.0.1:5432/postgres' npm run test:integration)
 ```
+
+통합 테스트는 일반·공개 공유·resumable·WebDAV 업로드, 중단/용량 초과 정리, 응답 유실 후
+재개, 변환 대기 중 업로드 응답과 썸네일을 검증합니다. Nginx를 설치하고
+`ORIGINVAULT_TEST_NGINX=1`도 지정하면 실제 frontend 프록시 설정의 스트리밍·로그를 검증합니다.
 
 모바일 Expo 프로젝트는 Compose 배포와 분리되어 있으며
 `(cd app && npm run typecheck)`로 확인합니다.

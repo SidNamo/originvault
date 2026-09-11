@@ -20,8 +20,9 @@ import { config } from './config.js';
 import { db } from './db.js';
 import { logForRequest, logger } from './logger.js';
 import { assertStorageAvailable, StorageQuotaError } from './quota.js';
-import { extractMetadata, isHiddenResource, originalCreatedAtFromMetadata, resolveInside, safeRelativeDirectory, safeSegment, userFilesRoot } from './storage.js';
-import { prepareFileThumbnail } from './thumbnails.js';
+import { extractMetadata, fileNameCandidate, isHiddenResource, originalCreatedAtFromMetadata, resolveInside, safeRelativeDirectory, safeSegment, storedContentType, userFilesRoot } from './storage.js';
+import { scheduleFileThumbnail } from './thumbnails.js';
+import { requestBody } from './requestBody.js';
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SESSION_ROUTE = '/api/upload-sessions';
@@ -160,7 +161,16 @@ export function normalizeUploadInput(body: unknown, configuredMaximum = maxUploa
   }
   const rawName = typeof input.originalName === 'string' ? input.originalName : '';
   if (!rawName || rawName.length > 1024) throw new HttpError(400, 'originalName is required');
-  const originalName = safeSegment(rawName);
+  const rawDirectory = String(input.relativeDirectory ?? '');
+  if (rawDirectory.length > 4096) throw new HttpError(400, 'relativeDirectory is too long');
+  let originalName: string;
+  let relativeDirectory: string;
+  try {
+    originalName = safeSegment(rawName);
+    relativeDirectory = safeRelativeDirectory(rawDirectory);
+  } catch (error) {
+    throw new HttpError(400, error instanceof Error ? error.message : 'Invalid upload path');
+  }
   const sizeBytes = parseNonNegativeInteger(input.sizeBytes, 'sizeBytes');
   if (sizeBytes > configuredMaximum) throw new HttpError(413, 'File is too large');
   const rawMimeType = input.mimeType === undefined || input.mimeType === null
@@ -173,10 +183,6 @@ export function normalizeUploadInput(body: unknown, configuredMaximum = maxUploa
     ? null
     : String(input.folderId);
   if (folderId && !UUID_PATTERN.test(folderId)) throw new HttpError(400, 'folderId is invalid');
-  const rawDirectory = input.relativeDirectory === undefined || input.relativeDirectory === null
-    ? ''
-    : String(input.relativeDirectory);
-  if (rawDirectory.length > 4096) throw new HttpError(400, 'relativeDirectory is too long');
   return {
     fingerprint,
     originalName,
@@ -184,7 +190,7 @@ export function normalizeUploadInput(body: unknown, configuredMaximum = maxUploa
     mimeType: rawMimeType,
     lastModified: normalizeLastModified(input.lastModified),
     folderId,
-    relativeDirectory: safeRelativeDirectory(rawDirectory),
+    relativeDirectory,
   };
 }
 
@@ -398,8 +404,7 @@ async function stageChunk(req: Request, user: SessionUser, sessionId: string, ma
   const handle = await open(stagedPath, 'wx', 0o600);
   let size = 0n;
   try {
-    for await (const value of req) {
-      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    for await (const chunk of requestBody(req)) {
       const nextSize = size + BigInt(chunk.length);
       if (nextSize > maximumBytes) throw new HttpError(413, 'Chunk exceeds the remaining upload size');
       let written = 0;
@@ -429,14 +434,11 @@ async function appendStagedChunk(
   stagedSize: bigint,
 ): Promise<{ session: UploadSessionRow; complete: boolean }> {
   const client = await db.connect();
-  let partPath: string | undefined;
-  let appendStarted = false;
-  let committed = false;
   try {
     await client.query('BEGIN');
     const session = await loadSession(client, user.id, sessionId, true);
     if (!session) throw new HttpError(404, 'Upload session not found');
-    partPath = await reconcilePartWithDatabase(user, session);
+    const partPath = await reconcilePartWithDatabase(user, session);
     const durableOffset = BigInt(session.offsetBytes);
     const totalSize = BigInt(session.sizeBytes);
     if (requestedOffset !== durableOffset) throw new OffsetMismatchError(durableOffset);
@@ -449,7 +451,6 @@ async function appendStagedChunk(
     if (stagedSize > totalSize - durableOffset) throw new HttpError(413, 'Chunk exceeds the remaining upload size');
 
     if (stagedSize > 0n) {
-      appendStarted = true;
       const writeStream = createWriteStream(partPath, { flags: 'a', mode: 0o600 });
       await pipeline(createReadStream(stagedPath), writeStream);
       const handle = await open(partPath, 'r');
@@ -464,7 +465,6 @@ async function appendStagedChunk(
       RETURNING ${SESSION_COLUMNS}
     `, [sessionId, user.id, newOffset.toString()]);
     await client.query('COMMIT');
-    committed = true;
     logger.debug({
       event: 'resumable_chunk_committed',
       userId: user.id,
@@ -477,11 +477,8 @@ async function appendStagedChunk(
     return { session: updated.rows[0]!, complete: newOffset === totalSize };
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
-    if (appendStarted && !committed && partPath) {
-      await truncate(partPath, Number(requestedOffset)).catch((truncateError) => {
-        logger.fatal({ event: 'resumable_chunk_rollback_truncate_failed', userId: user.id, sessionId, requestedOffset: requestedOffset.toString(), err: truncateError }, 'Could not roll back partially appended upload bytes');
-      });
-    }
+    // Reconcile any uncommitted tail under the next session row lock. Truncating
+    // after ROLLBACK can destroy a concurrent retry, or a COMMIT whose reply was lost.
     throw error;
   } finally {
     client.release();
@@ -534,11 +531,6 @@ async function ensureFolderPath(
   return { folderId: parentId, relativePath: parentPath };
 }
 
-function candidateName(requested: string, index: number): string {
-  const parsed = path.parse(safeSegment(requested));
-  return index === 0 ? `${parsed.name}${parsed.ext}` : `${parsed.name} (${index})${parsed.ext}`;
-}
-
 async function pathExists(filePath: string): Promise<boolean> {
   try {
     await access(filePath);
@@ -558,7 +550,7 @@ async function chooseAvailableDestination(
 ): Promise<{ storedName: string; relativePath: string }> {
   const root = userFilesRoot(user.storageKey);
   for (let index = 0; index < 100_000; index += 1) {
-    const storedName = candidateName(originalName, index);
+    const storedName = fileNameCandidate(originalName, index);
     const relativePath = path.join(directoryPath, storedName);
     const reserved = await client.query('SELECT 1 FROM upload_sessions WHERE user_id=$1 AND final_relative_path=$2 AND id<>$3', [user.id, relativePath, sessionId]);
     if (reserved.rowCount) continue;
@@ -677,7 +669,7 @@ async function commitCompletedFile(
       session.storedName,
       session.storedName,
       session.finalRelativePath,
-      session.mimeType,
+      storedContentType(session.mimeType, metadata),
       session.sizeBytes,
       sha256,
       session.identityHash,
@@ -733,11 +725,11 @@ async function finalizeSession(user: SessionUser, sessionId: string, knownFileId
       const sha256 = await hashFile(finalPath);
       const metadata = await extractMetadata(finalPath);
       const completed = await commitCompletedFile(client, user, session, sha256, metadata);
-      await prepareFileThumbnail({
+      scheduleFileThumbnail({
         sourcePath: finalPath,
         sha256,
         name: session.storedName ?? session.originalName,
-        mimeType: session.mimeType,
+        mimeType: storedContentType(session.mimeType, metadata),
       });
       await unlink(partPath).catch((error) => logger.warn({ event: 'completed_upload_part_cleanup_failed', userId: user.id, sessionId, err: error }, 'Completed upload part file could not be removed'));
       await rm(chunkDirectory(user, sessionId), { recursive: true, force: true }).catch((error) => logger.warn({ event: 'completed_upload_chunk_directory_cleanup_failed', userId: user.id, sessionId, err: error }, 'Completed upload staging directory could not be removed'));
@@ -977,6 +969,7 @@ export function createResumableUploadRouter(): Router {
   router.patch(`${SESSION_ROUTE}/:id`, requireAuth, asyncHandler(async (req, res) => patchSession(req, res)));
   router.delete(`${SESSION_ROUTE}/:id`, requireAuth, asyncHandler(async (req, res) => cancelSession(req, res)));
   router.use((error: unknown, req: Request, res: Response, next: NextFunction) => {
+    if (res.destroyed) return;
     if (res.headersSent) {
       next(error);
       return;
@@ -996,6 +989,7 @@ export function createResumableUploadRouter(): Router {
     };
     if (statusCode >= 500) logForRequest(req).error(fields, 'Resumable upload request failed');
     else logForRequest(req).warn(fields, 'Resumable upload request was rejected');
+    if (!req.destroyed) req.resume();
     res.status(statusCode).json({ error: error instanceof Error ? error.message : 'Resumable upload failed' });
   });
   return router;

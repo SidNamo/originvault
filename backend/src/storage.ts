@@ -11,10 +11,47 @@ import { logger } from './logger.js';
 
 const execFileAsync = promisify(execFile);
 
+function truncateUtf8(value: string, maximumBytes: number): string {
+  let result = '';
+  let bytes = 0;
+  for (const character of value) {
+    const length = Buffer.byteLength(character);
+    if (bytes + length > maximumBytes) break;
+    result += character;
+    bytes += length;
+  }
+  return result;
+}
+
+function fitFileName(name: string, suffix = '', preserveExtension = true): string {
+  const extension = preserveExtension ? path.extname(name) : '';
+  const budget = 255 - Buffer.byteLength(suffix);
+  if (Buffer.byteLength(extension) >= budget) return `${truncateUtf8(name, budget)}${suffix}`;
+  const stem = extension ? name.slice(0, -extension.length) : name;
+  return `${truncateUtf8(stem, budget - Buffer.byteLength(extension))}${suffix}${extension}`;
+}
+
 export function safeSegment(value: string): string {
   const clean = path.basename(value).replace(/[\u0000-\u001f<>:"/\\|?*]/g, '_').trim();
   if (!clean || clean === '.' || clean === '..') throw new Error('Invalid file or folder name');
-  return clean.slice(0, 255);
+  return fitFileName(clean);
+}
+
+export function fileNameCandidate(requested: string, index: number, kind: 'file' | 'folder' = 'file'): string {
+  if (!Number.isSafeInteger(index) || index < 0) throw new Error('File name index must be a non-negative integer');
+  return fitFileName(safeSegment(requested), index ? ` (${index})` : '', kind === 'file');
+}
+
+export function storedContentType(requested: string | undefined, metadata: Record<string, unknown>): string {
+  const normalize = (value: unknown): string | undefined => {
+    if (typeof value !== 'string') return undefined;
+    const mime = value.split(';', 1)[0]!.trim().toLowerCase();
+    return mime.length <= 255 && /^[\w!#$&^_.+-]+\/[\w!#$&^_.+-]+$/.test(mime) ? mime : undefined;
+  };
+  const extracted = normalize(metadata['File:MIMEType']);
+  return extracted && extracted !== 'application/octet-stream'
+    ? extracted
+    : normalize(requested) ?? extracted ?? 'application/octet-stream';
 }
 
 export function safeRelativeDirectory(value: string): string {
@@ -93,11 +130,6 @@ export function resolveInside(root: string, relativePath: string): string {
   return target;
 }
 
-function candidateName(requested: string, index: number): string {
-  const parsed = path.parse(safeSegment(requested));
-  return index === 0 ? `${parsed.name}${parsed.ext}` : `${parsed.name} (${index})${parsed.ext}`;
-}
-
 export async function storeOriginal(input: {
   storageKey: string;
   username: string;
@@ -120,7 +152,7 @@ export async function storeOriginal(input: {
   try {
     await pipeline(input.stream, createWriteStream(temporaryPath, { flags: 'wx', mode: 0o600 }));
     for (let index = 0; index < 100_000; index += 1) {
-      storedName = candidateName(input.originalName, index);
+      storedName = fileNameCandidate(input.originalName, index);
       finalPath = resolveInside(directory, storedName);
       try {
         await link(temporaryPath, finalPath);

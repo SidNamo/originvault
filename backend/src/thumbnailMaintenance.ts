@@ -4,6 +4,8 @@ import { resolveInside, userFilesRoot } from './storage.js';
 import {
   getOrCreateThumbnail,
   hasCachedThumbnail,
+  ThumbnailDeferredError,
+  thumbnailFailureReason,
   thumbnailKind,
 } from './thumbnails.js';
 
@@ -26,6 +28,7 @@ export type ThumbnailBackfillStats = {
   generatedThumbnails: number;
   unavailableFiles: number;
   failedThumbnails: number;
+  deferredThumbnails: number;
 };
 
 export type ThumbnailBackfillPage = (
@@ -61,6 +64,7 @@ export async function backfillMissingThumbnails(
     generatedThumbnails: 0,
     unavailableFiles: 0,
     failedThumbnails: 0,
+    deferredThumbnails: 0,
   };
   let cursor: string | null = null;
 
@@ -85,12 +89,15 @@ export async function backfillMissingThumbnails(
       stats.generatedThumbnails += 1;
       return true;
     } catch (error: any) {
-      if (error?.code === 'ENOENT' || error?.code === 'ESTALE') {
+      if (error instanceof ThumbnailDeferredError) {
+        stats.deferredThumbnails += 1;
+        logger.debug({ event: 'thumbnail_backfill_deferred', fileId: file.id, sha256, reason: error.reason, retryAt: new Date(error.retryAt).toISOString() }, 'Thumbnail backfill is waiting for its retry interval');
+      } else if (error?.code === 'ENOENT' || error?.code === 'ESTALE') {
         stats.unavailableFiles += 1;
         logger.debug({ event: 'thumbnail_backfill_source_unavailable', fileId: file.id, sha256 }, 'Thumbnail backfill source is unavailable');
       } else {
         stats.failedThumbnails += 1;
-        logger.warn({ event: 'thumbnail_backfill_file_failed', fileId: file.id, sha256, err: error }, 'Existing file thumbnail backfill failed');
+        logger.warn({ event: 'thumbnail_backfill_file_failed', fileId: file.id, name: file.name, mimeType: file.mimeType, sha256, reason: thumbnailFailureReason(error), err: error }, 'Existing file thumbnail backfill failed');
       }
       return false;
     }
