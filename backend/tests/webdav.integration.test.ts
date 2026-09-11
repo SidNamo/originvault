@@ -3,7 +3,7 @@ import { execFile, spawn } from 'node:child_process';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import http from 'node:http';
-import { mkdir, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, stat, statfs, utimes, writeFile } from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -175,6 +175,93 @@ test('WebDAV preserves original metadata and serves prebuilt/on-demand video pos
       return { authorization: `Bearer ${payload.token}` };
     };
     const dav = await makeToken();
+    const waitForEvent = async (requestId: string, event: string) => {
+      for (let i = 0; i < 150; i++) {
+        if (backendOutput.split('\n').some(line => line.includes(requestId) && line.includes(`"event":"${event}"`))) return;
+        await delay(20);
+      }
+      assert.fail(`Request ${requestId} did not reach ${event}`);
+    };
+    const heldPut = (name: string, bytes: Buffer) => {
+      const requestId = `held-${randomUUID()}`;
+      let upload!: http.ClientRequest;
+      const result = new Promise<number>((resolve, reject) => {
+        upload = http.request(`${origin}/webdav/${name}`, { method: 'PUT', headers: {
+          ...dav, 'content-length': String(bytes.length), 'x-request-id': requestId,
+        } }, (response) => { response.resume(); response.on('end', () => resolve(response.statusCode!)); });
+        upload.on('error', reject);
+        upload.write(bytes.subarray(0, 4));
+      });
+      void result.catch(() => undefined);
+      return { upload, requestId, result, finish: () => upload.end(bytes.subarray(4)), started: () => waitForEvent(requestId, 'webdav_put_started') };
+    };
+    // Hold an upload open like a slow HDD/network transfer. Autosync must still be
+    // able to upload another file and perform HEAD/DELETE/MOVE before this ends.
+    const slowBytes = Buffer.from('slow upload still in progress');
+    const slow = heldPut('slow.bin', slowBytes);
+    try {
+      await slow.started();
+      const fast = await request('/webdav/fast.bin~ttxpart~', { method: 'PUT', headers: dav, body: 'fast', signal: AbortSignal.timeout(1500) }, 201);
+      await fast.text();
+      await request('/webdav/fast.bin', { method: 'HEAD', headers: dav, signal: AbortSignal.timeout(1500) }, 404);
+      await request('/webdav/fast.bin', { method: 'DELETE', headers: dav, signal: AbortSignal.timeout(1500) }, 404);
+      await request('/webdav/fast.bin~ttxpart~', { method: 'MOVE', headers: { ...dav, destination: `${origin}/webdav/fast.bin` }, signal: AbortSignal.timeout(1500) }, 201);
+      assert.deepEqual(Buffer.from(await (await request('/webdav/fast.bin', { headers: dav, signal: AbortSignal.timeout(1500) }, 200)).arrayBuffer()), Buffer.from('fast'));
+      slow.finish();
+      assert.equal(await slow.result, 201);
+      assert.deepEqual(await readFile(path.join(root, 'slow.bin')), slowBytes);
+    } finally {
+      slow.upload.destroy();
+      await slow.result.catch(() => undefined);
+    }
+    // Quota and the destination are rechecked after independent transfers finish.
+    const quotaUsed = (await db.query('SELECT SUM(size_bytes)::text AS bytes FROM files WHERE user_id=$1', [userId])).rows[0].bytes;
+    await db.query('UPDATE users SET storage_quota_bytes=$2 WHERE id=$1', [userId, (BigInt(quotaUsed) + 30n).toString()]);
+    const contenders = [heldPut('quota-a.bin', Buffer.alloc(20)), heldPut('quota-b.bin', Buffer.alloc(20))];
+    try {
+      await Promise.all(contenders.map(upload => upload.started()));
+      contenders.forEach(upload => upload.finish());
+      assert.deepEqual((await Promise.all(contenders.map(upload => upload.result))).sort(), [201, 507]);
+      const after = (await db.query('SELECT SUM(size_bytes)::text AS bytes FROM files WHERE user_id=$1', [userId])).rows[0].bytes;
+      assert.equal(BigInt(after), BigInt(quotaUsed) + 20n);
+    } finally {
+      contenders.forEach(upload => upload.upload.destroy());
+      await Promise.allSettled(contenders.map(upload => upload.result));
+      await db.query('UPDATE users SET storage_quota_bytes=NULL WHERE id=$1', [userId]);
+    }
+    await request('/webdav/receiving', { method: 'MKCOL', headers: dav }, 201);
+    const movedParent = heldPut('receiving/stale.bin', Buffer.from('original destination'));
+    try {
+      await movedParent.started();
+      await request('/webdav/receiving', { method: 'MOVE', headers: { ...dav, destination: `${origin}/webdav/received` }, signal: AbortSignal.timeout(1500) }, 201);
+      movedParent.finish();
+      assert.equal(await movedParent.result, 409, 'upload must not recreate a moved parent');
+      assert.equal((await db.query("SELECT 1 FROM files WHERE user_id=$1 AND stored_name='stale.bin'", [userId])).rowCount, 0);
+    } finally { movedParent.upload.destroy(); await movedParent.result.catch(() => undefined); }
+    const blocker = await db.connect();
+    await blocker.query('SELECT pg_advisory_lock(hashtext($1))', [`originvault:${userId}`]);
+    const cancelled = heldPut('cancelled-before-commit.bin', Buffer.from('finished transfer, closed response'));
+    try {
+      await cancelled.started();
+      cancelled.finish();
+      await waitForEvent(cancelled.requestId, 'webdav_put_received');
+      cancelled.upload.destroy();
+      await waitForEvent(cancelled.requestId, 'http_request_aborted');
+    } finally {
+      await blocker.query('SELECT pg_advisory_unlock(hashtext($1))', [`originvault:${userId}`]);
+      blocker.release();
+      cancelled.upload.destroy();
+      await cancelled.result.catch(() => undefined);
+    }
+    await waitForEvent(cancelled.requestId, 'webdav_request_failed');
+    assert.ok(backendOutput.split('\n').some(line => line.includes(cancelled.requestId) && line.includes('"statusCode":499')));
+    assert.equal((await db.query("SELECT 1 FROM files WHERE user_id=$1 AND stored_name='cancelled-before-commit.bin'", [userId])).rowCount, 0);
+    await assert.rejects(stat(path.join(root, 'cancelled-before-commit.bin')), (error: any) => error.code === 'ENOENT');
+    const physical = await statfs(root, { bigint: true });
+    const capacity = await (await request('/webdav/', { method: 'PROPFIND', headers: { ...dav, depth: '0' } }, 207)).text();
+    const diskUsed = BigInt(capacity.match(/<D:quota-used-bytes>(\d+)</)![1]!);
+    const diskAvailable = BigInt(capacity.match(/<D:quota-available-bytes>(\d+)</)![1]!);
+    assert.equal(diskUsed + diskAvailable, physical.blocks * physical.bsize, 'unlimited accounts report their backing filesystem capacity');
     const streamedPut = (name: string, body: Buffer, headers: Record<string, string> = {}) => new Promise<{ status: number; body: string }>((resolve, reject) => {
       const upload = http.request(`${origin}/webdav/${name}`, { method: 'PUT', headers: { ...dav, ...headers }, timeout: 5000 }, (response) => {
         let responseBody = '';
@@ -263,6 +350,8 @@ test('WebDAV preserves original metadata and serves prebuilt/on-demand video pos
     await request('/webdav/', { method: 'PROPPATCH', headers: { ...scoped, 'content-type': 'application/xml' },
       body: patchBody('<d:creationdate>2000-01-01T00:00:00Z</d:creationdate><d:getlastmodified>2003-01-01T00:00:00Z</d:getlastmodified>') }, 207);
     const scopedProperties = await (await request('/webdav/', { method: 'PROPFIND', headers: { ...scoped, depth: '0' } }, 207)).text();
+    assert.match(scopedProperties, /<D:quota-used-bytes>\d+<\/D:quota-used-bytes>/);
+    assert.match(scopedProperties, /<D:quota-available-bytes>\d+<\/D:quota-available-bytes>/);
     assert.match(scopedProperties, /2000-01-01T00:00:00.000Z/);
     assert.match(scopedProperties, /Wed, 01 Jan 2003 00:00:00 GMT/);
 

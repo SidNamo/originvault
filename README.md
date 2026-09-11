@@ -2,8 +2,8 @@
 
 OriginVault는 개인 서버에서 운영하는 원본 파일 금고입니다. 업로드 바이트를 변환하지
 않고 보관하며, 파일 메타데이터를 색인해 인증된 파일 탐색, 공개 공유 링크, 범위 제한
- WebDAV를 제공하며 quota가 설정된 계정은 WebDAV 클라이언트에서 사용량과 남은 용량을
- 확인할 수 있습니다. 원본 파일은 호스트 디렉터리에, 사용자·공유·업로드 상태와
+ WebDAV를 제공합니다. WebDAV 클라이언트는 quota가 있는 계정의 사용량·남은 한도와,
+ quota가 없는 계정의 실제 저장 디스크 용량을 확인할 수 있습니다. 원본 파일은 호스트 디렉터리에, 사용자·공유·업로드 상태와
 색인은 PostgreSQL에 보관합니다.
 
 ## 배포 구조
@@ -136,6 +136,12 @@ backend는 PostgreSQL advisory lock과 파일 변경 저널로 DB 색인과 파�
 
 ### WebDAV 원본 메타데이터
 
+PUT 수신과 메타데이터 추출은 독립된 임시 파일에서 수행하며 사용자 전체 잠금이나
+전용 DB 연결을 점유하지 않습니다. 최종 저장·색인 구간에서만 잠금을 잡고 토큰,
+대상 폴더, 덮어쓰기 대상과 quota를 다시 검사합니다. 큰 파일 수신 중에도 다른 파일의
+PUT 및 HEAD/DELETE/MOVE가 진행됩니다. 수신 완료 뒤 저장 전 연결이 종료되면 임시
+파일을 정리하며, 종료된 이전 요청이 나중에 재시도한 파일을 덮어쓰지 않도록 합니다.
+
 PUT는 수신한 바이트의 SHA-256·크기를 계산하고 ExifTool로 MIME·EXIF·미디어 정보를
 읽습니다. 덮어쓰기는 새 바이트에서 메타데이터를 다시 추출합니다. EXIF 촬영일과 별도
 시간대 오프셋, QuickTime 생성일을 원본 생성일에 반영하며, 기존 색인에서 누락된
@@ -153,6 +159,30 @@ UTC 기준으로 색인하되 추출한 원문 날짜를 메타데이터에 보�
 서버 업로드 시간을 원본 수정일로 기록하지 않습니다. PROPFIND/GET은 알려진 원본 날짜를
 우선 반환하고, 없으면 서버 색인 날짜를 사용합니다. 지원하지 않는 PROPPATCH 속성이
 섞인 요청은 전체를 적용하지 않고 207 응답의 각 속성 상태로 실패를 알립니다.
+
+### WebDAV 용량과 외부 HDD
+
+PROPFIND는 조회한 컬렉션의 실제 경로에서 `statfs`로 디스크 용량을 읽습니다.
+외부 HDD가 bind mount된 경우 해당 HDD의 수치가 사용됩니다.
+
+- quota 없음: 해당 파일시스템의 사용량과 프로세스가 사용할 수 있는 여유 공간을 반환합니다.
+- quota 있음: 계정 사용량(휴지통·예약 업로드 포함)을 반환하며, 남은 용량은 계정 잔여 한도와
+  실제 디스크 여유 공간 중 작은 값입니다.
+- 파일시스템 조회 실패: `webdav_storage_stat_failed`에 원인을 기록하며, 설정된 quota는
+  계속 반환합니다.
+
+원본을 외부 HDD에 두려면 backend의 `/data/files` 전체를 해당 디렉터리에 연결합니다.
+원본과 `.dav-staging`, `.upload-sessions`도 같은 파일시스템에 있어야 원자적 저장이 가능합니다.
+예를 들어 기존 backend의 volumes에 다음처럼 파일 저장 경로를 지정합니다.
+
+```yaml
+volumes:
+  - ./data:/data
+  - /mnt/external-hdd/originvault/files:/data/files
+```
+
+`DATA_ROOT`는 컨테이너 내부 경로(`/data/files`)로 유지합니다. 실제로 보고되는 용량은
+컨테이너의 `statfs` 결과이며, Docker Desktop 환경에서는 드라이브 공유 방식도 확인합니다.
 
 ## 데이터베이스 migration
 
@@ -183,10 +213,15 @@ docker compose logs -f frontend backend
 
 `LOG_LEVEL=debug`로 재생성한 backend는 요청 도착 즉시 `http_request_received`를
 기록하고, 완료·중단 로그에 `/webdav/`를 포함한 전체 경로를 유지합니다. HTTP 파서에서
-라우팅 전 거부된 요청은 `http_client_error`, 유휴 연결 제한은 `http_connection_timeout`으로
+라우팅 전 거부된 요청은 `http_client_error`, 진행 중인 요청의 유휴 연결 제한은 `http_connection_timeout`으로
 남깁니다. frontend는 WebDAV 요청과 HTTP 4xx·5xx를 `proxy_request_completed`로 출력하며
 backend와 같은 `requestId`, 응답 코드와 `upstreamStatus`를 비교할 수 있습니다.
 공유 토큰과 쿼리 문자열은 프록시 접근 로그에서 제외합니다.
+
+응답을 마친 keep-alive 연결의 정상 만료는 타임아웃 WARN을 남기지 않습니다.
+`webdav_put_completed`의 `receiveDurationMs`, `preparationDurationMs`, `lockWaitMs`,
+`commitDurationMs`로 수신, 디스크 sync·메타데이터 추출, 잠금 대기, 최종 저장 시간을
+구분할 수 있습니다. 연결 종료로 실패한 WebDAV 요청은 로그에서 499로 분류합니다.
 
 frontend 로그에 PUT가 없으면 NPM 접근 로그와 클라이언트 로그를 확인합니다. NPM에서
 이미 요청을 거부했다면 frontend/backend에는 기록되지 않습니다. NPM의 해당 Proxy Host에도

@@ -15,7 +15,7 @@ import { resumableUploadRouter } from './resumableUploads.js';
 import { extractMetadata, isHiddenResource, originalCreatedAtFromMetadata, resolveInside, safeRelativeDirectory, safeSegment, storedContentType, storeOriginal, userFilesRoot } from './storage.js';
 import { MultipartUploadError, receiveMultipartFile } from './multipartUpload.js';
 import { pruneEmptyActiveFolders, removeEmptyActiveFolderPaths } from './folderCleanup.js';
-import { logForRequest, logger, logSafePath, requestLogging } from './logger.js';
+import { logConnectionTimeout, logForRequest, logger, logSafePath, requestLogging } from './logger.js';
 import { assertStorageAvailable, StorageQuotaError } from './quota.js';
 import { shareRouter } from './shares.js';
 import { webdavManagementRouter, webdavRouter } from './webdav.js';
@@ -668,7 +668,7 @@ async function start(): Promise<void> {
   // Bound inactivity rather than total transfer time for slow multi-gigabyte uploads.
   server.requestTimeout = 0;
   server.setTimeout(60 * 60 * 1_000, (socket) => {
-    logger.warn({ event: 'http_connection_timeout', remoteAddress: socket.remoteAddress }, 'HTTP connection exceeded the inactivity limit');
+    logConnectionTimeout(socket);
     socket.destroy();
   });
   server.on('clientError', (error, socket) => {

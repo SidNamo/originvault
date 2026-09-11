@@ -50,3 +50,53 @@ test('an unavailable file sink falls back to stdout without terminating the proc
   assert.match(result.stdout, /"event":"fallback_logger_test"/);
   assert.match(result.stderr, /"event":"log_file_write_disabled"/);
 });
+
+test('normal keep-alive closure is quiet while an active request timeout includes its request id', async () => {
+  const temp = await mkdtemp(path.join(os.tmpdir(), 'originvault-http-timeouts-'));
+  const script = `
+    import http from 'node:http';
+    import { once } from 'node:events';
+    import express from 'express';
+    process.env.LOG_DIR = ${JSON.stringify(temp)};
+    const { logConnectionTimeout, requestLogging } = await import('./src/logger.js');
+    const app = express();
+    app.use(requestLogging);
+    app.get('/quick', (_req, res) => res.end('done'));
+    app.get('/slow', () => {});
+    const server = app.listen(0, '127.0.0.1');
+    server.keepAliveTimeout = 20;
+    server.keepAliveTimeoutBuffer = 0;
+    server.setTimeout(100, (socket) => { logConnectionTimeout(socket); socket.destroy(); });
+    await once(server, 'listening');
+    const port = server.address().port;
+    const agent = new http.Agent({ keepAlive: true });
+    await new Promise((resolve, reject) => {
+      const request = http.get({ hostname: '127.0.0.1', port, path: '/quick', agent }, res => res.resume());
+      request.on('socket', socket => socket.once('close', resolve));
+      request.on('error', reject);
+    });
+    await new Promise((resolve) => {
+      const request = http.get({ hostname: '127.0.0.1', port, path: '/slow', headers: { 'x-request-id': 'slow-timeout' } });
+      request.on('error', resolve);
+    });
+    agent.destroy();
+    await new Promise(resolve => server.close(resolve));
+  `;
+  try {
+    const output = await new Promise<string>((resolve, reject) => {
+      const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
+        cwd: path.resolve(import.meta.dirname, '..'), stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.on('data', (chunk) => { stdout += chunk.toString(); });
+      child.stderr.on('data', (chunk) => { stderr += chunk.toString(); });
+      child.on('error', reject);
+      child.on('close', (code) => code === 0 ? resolve(stdout) : reject(new Error(stderr)));
+    });
+    const timeouts = output.trim().split('\n').map(line => JSON.parse(line)).filter(line => line.event === 'http_connection_timeout');
+    assert.equal(timeouts.length, 1);
+    assert.equal(timeouts[0].requestId, 'slow-timeout');
+    assert.equal(timeouts[0].path, '/slow');
+  } finally { await rm(temp, { recursive: true, force: true }); }
+});

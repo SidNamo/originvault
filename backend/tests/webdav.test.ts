@@ -58,3 +58,22 @@ test('WebDAV reports effective usage and available bytes for quota-limited users
   });
   assert.equal(webdavQuota({ usedBytes: '600', reservedBytes: '0', quotaBytes: null }), null);
 });
+
+test('WebDAV reports physical HDD capacity without a quota and caps quota space by available disk', () => {
+  const filesystem = { totalBytes: '9007199254741993', availableBytes: '250' };
+  assert.deepEqual(webdavQuota({ usedBytes: '600', reservedBytes: '50', quotaBytes: null }, filesystem), {
+    usedBytes: '9007199254741743', availableBytes: '250',
+  });
+  assert.deepEqual(webdavQuota({ usedBytes: '600', reservedBytes: '50', quotaBytes: '1000' }, filesystem), {
+    usedBytes: '650', availableBytes: '250',
+  });
+  assert.deepEqual(webdavQuota({ usedBytes: '600', reservedBytes: '50', quotaBytes: '700' }, filesystem), {
+    usedBytes: '650', availableBytes: '50',
+  });
+  assert.deepEqual(webdavQuota({ usedBytes: '600', reservedBytes: '50', quotaBytes: '1000' }, { totalBytes: '1000', availableBytes: '0' }), {
+    usedBytes: '650', availableBytes: '0',
+  });
+  assert.deepEqual(webdavQuota({ usedBytes: '600', reservedBytes: '50', quotaBytes: '1000' }, null), {
+    usedBytes: '650', availableBytes: '350',
+  });
+});

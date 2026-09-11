@@ -1,6 +1,7 @@
 import { createWriteStream, mkdirSync, readdirSync, unlinkSync, type WriteStream } from 'node:fs';
 import { Writable } from 'node:stream';
 import { randomUUID } from 'node:crypto';
+import type { Socket } from 'node:net';
 import type { NextFunction, Request, Response } from 'express';
 import pino from 'pino';
 import { config } from './config.js';
@@ -137,11 +138,31 @@ export function logSafePath(value: string): string {
     .replace(/(\/api\/previews\/)[^/]+/g, '$1[REDACTED]');
 }
 
+const activeHttpRequests = new WeakMap<Socket, { req: Request; path: string }>();
+
+export function logConnectionTimeout(socket: Socket): void {
+  const active = activeHttpRequests.get(socket);
+  // Node also invokes the timeout listener when an idle keep-alive expires.
+  // That normal connection cleanup is not a stalled upload.
+  if (!active) return;
+  const { req } = active;
+  logger.warn({
+    event: 'http_connection_timeout', requestId: req.requestId, method: req.method,
+    path: active.path, remoteAddress: socket.remoteAddress, requestComplete: req.complete,
+    durationMs: req.requestStartedAt ? Number(process.hrtime.bigint() - req.requestStartedAt) / 1_000_000 : undefined,
+  }, 'Active HTTP request exceeded the inactivity limit');
+}
+
 export function requestLogging(req: Request, res: Response, next: NextFunction): void {
   const incomingId = req.header('x-request-id');
   req.requestId = incomingId && /^[a-zA-Z0-9._-]{1,100}$/.test(incomingId) ? incomingId : randomUUID();
   req.requestStartedAt = process.hrtime.bigint();
   const requestPath = logSafePath((req.originalUrl || req.url).split('?', 1)[0]!);
+  const activeRequest = { req, path: requestPath };
+  activeHttpRequests.set(req.socket, activeRequest);
+  const clearActiveRequest = () => {
+    if (activeHttpRequests.get(req.socket) === activeRequest) activeHttpRequests.delete(req.socket);
+  };
   res.setHeader('X-Request-ID', req.requestId);
   logger.debug({
     event: 'http_request_received', requestId: req.requestId, method: req.method,
@@ -153,6 +174,7 @@ export function requestLogging(req: Request, res: Response, next: NextFunction):
 
   let completed = false;
   res.on('finish', () => {
+    clearActiveRequest();
     completed = true;
     const durationMs = req.requestStartedAt ? Number(process.hrtime.bigint() - req.requestStartedAt) / 1_000_000 : undefined;
     const fields = { event: 'http_request_completed', requestId: req.requestId, userId: req.user?.id, username: req.user?.username, method: req.method, path: requestPath, statusCode: res.statusCode, durationMs };
@@ -161,6 +183,7 @@ export function requestLogging(req: Request, res: Response, next: NextFunction):
     else logger.info(fields, 'HTTP request completed');
   });
   res.on('close', () => {
+    clearActiveRequest();
     if (!completed) logger.warn({ event: 'http_request_aborted', requestId: req.requestId, method: req.method, path: requestPath,
       requestComplete: req.complete, requestAborted: req.aborted, headersSent: res.headersSent,
       durationMs: req.requestStartedAt ? Number(process.hrtime.bigint() - req.requestStartedAt) / 1_000_000 : undefined,

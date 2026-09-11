@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, rename, rm, statfs } from 'node:fs/promises';
+import { mkdir, rename, rm } from 'node:fs/promises';
 import path from 'node:path';
 import bcrypt from 'bcryptjs';
 import express, { type NextFunction, type Request, type Response } from 'express';
@@ -7,7 +7,7 @@ import { loadSessionUser, publicUser, requireAdmin, requireAuth, signToken } fro
 import { config } from './config.js';
 import { db } from './db.js';
 import { logForRequest } from './logger.js';
-import { getStorageUsage } from './quota.js';
+import { getFilesystemStorage, getStorageUsage } from './quota.js';
 import { resolveInside, userFilesRoot } from './storage.js';
 
 class AccountError extends Error {
@@ -86,11 +86,7 @@ export function createAccountRouter(): express.Router {
     }
     let serverStorage: { totalBytes: string; availableBytes: string } | null = null;
     try {
-      const storage = await statfs(config.dataRoot, { bigint: true });
-      serverStorage = {
-        totalBytes: (storage.blocks * storage.bsize).toString(),
-        availableBytes: (storage.bavail * storage.bsize).toString(),
-      };
+      serverStorage = await getFilesystemStorage(config.dataRoot);
     } catch (error) {
       logForRequest(req).warn(
         { event: 'server_storage_stat_failed', dataRoot: config.dataRoot, err: error },

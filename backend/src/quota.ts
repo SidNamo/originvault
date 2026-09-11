@@ -1,3 +1,4 @@
+import { statfs } from 'node:fs/promises';
 import type { Pool, PoolClient } from 'pg';
 import { db } from './db.js';
 
@@ -9,6 +10,22 @@ export interface StorageUsage {
   trashBytes: string;
   reservedBytes: string;
   quotaBytes: string | null;
+}
+
+export interface FilesystemStorage {
+  totalBytes: string;
+  availableBytes: string;
+}
+
+export async function getFilesystemStorage(directory: string): Promise<FilesystemStorage> {
+  const storage = await statfs(directory, { bigint: true });
+  if (storage.bsize <= 0n || storage.blocks < 0n) throw new Error('Filesystem capacity is unavailable');
+  const totalBytes = storage.blocks * storage.bsize;
+  const available = storage.bavail * storage.bsize;
+  return {
+    totalBytes: totalBytes.toString(),
+    availableBytes: (available < 0n ? 0n : available > totalBytes ? totalBytes : available).toString(),
+  };
 }
 
 export class StorageQuotaError extends Error {

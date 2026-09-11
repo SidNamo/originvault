@@ -19,7 +19,7 @@ import {
   removeMutationJournal,
   writeMutationJournal,
 } from './mutationJournal.js';
-import { assertStorageAvailable, getStorageUsage, StorageQuotaError, type StorageUsage } from './quota.js';
+import { assertStorageAvailable, getFilesystemStorage, getStorageUsage, StorageQuotaError, type FilesystemStorage, type StorageUsage } from './quota.js';
 import { extractMetadata, isHiddenResource, originalCreatedAtFromMetadata, resolveInside, safeSegment, storedContentType, userFilesRoot } from './storage.js';
 import { scheduleFileThumbnail } from './thumbnails.js';
 import { requestBody } from './requestBody.js';
@@ -82,10 +82,17 @@ export function webdavContentType(requested: string | undefined, metadata: Recor
   return storedContentType(requested, metadata);
 }
 
-export function webdavQuota(usage: Pick<StorageUsage, 'usedBytes' | 'reservedBytes' | 'quotaBytes'>): { usedBytes: string; availableBytes: string } | null {
-  if (usage.quotaBytes === null) return null;
+export function webdavQuota(
+  usage: Pick<StorageUsage, 'usedBytes' | 'reservedBytes' | 'quotaBytes'>,
+  filesystem?: FilesystemStorage | null,
+): { usedBytes: string; availableBytes: string } | null {
+  if (usage.quotaBytes === null) return filesystem ? {
+    usedBytes: (BigInt(filesystem.totalBytes) - BigInt(filesystem.availableBytes)).toString(),
+    availableBytes: filesystem.availableBytes,
+  } : null;
   const usedBytes = BigInt(usage.usedBytes) + BigInt(usage.reservedBytes);
-  const availableBytes = BigInt(usage.quotaBytes) - usedBytes;
+  let availableBytes = BigInt(usage.quotaBytes) - usedBytes;
+  if (filesystem && BigInt(filesystem.availableBytes) < availableBytes) availableBytes = BigInt(filesystem.availableBytes);
   return {
     usedBytes: usedBytes.toString(),
     availableBytes: (availableBytes > 0n ? availableBytes : 0n).toString(),
@@ -234,14 +241,25 @@ async function handlePropfind(req: Request, res: Response, identity: DavIdentity
   if (!resource) throw new DavError(404, 'Resource not found');
   const depth = req.header('depth') ?? '1';
   if (depth !== '0' && depth !== '1') throw new DavError(403, 'Only Depth 0 and 1 are supported');
-  const quota = resource.type === 'folder' ? webdavQuota(await getStorageUsage(identity.userId)) : null;
+  let quota: ReturnType<typeof webdavQuota> = null;
+  if (resource.type === 'folder') {
+    const usage = await getStorageUsage(identity.userId);
+    let filesystem: FilesystemStorage | null = null;
+    try {
+      // Query the collection's real filesystem, including a bind-mounted HDD.
+      filesystem = await getFilesystemStorage(resolveInside(userFilesRoot(identity.storageKey), resource.relativePath));
+    } catch (error) {
+      logForRequest(req).warn({ event: 'webdav_storage_stat_failed', relativePath: resource.relativePath, err: error }, 'WebDAV filesystem capacity could not be read');
+    }
+    quota = webdavQuota(usage, filesystem);
+  }
   const responses = [propertyResponse(resource, segments, quota)];
   if (depth === '1' && resource.type === 'folder') {
     const [folders, files] = await Promise.all([
       db.query(`SELECT id,name,relative_path AS "relativePath",COALESCE(original_created_at,created_at) AS "createdAt",COALESCE(original_modified_at,modified_at) AS "modifiedAt" FROM folders WHERE user_id=$1 AND parent_id IS NOT DISTINCT FROM $2 AND trashed_at IS NULL ORDER BY name`, [identity.userId, resource.folderId]),
       db.query(`SELECT id,folder_id AS "folderId",stored_name AS name,relative_path AS "relativePath",mime_type AS "mimeType",size_bytes::text AS "sizeBytes",sha256,COALESCE(original_created_at,created_at) AS "createdAt",COALESCE(client_last_modified,modified_at) AS "modifiedAt" FROM files WHERE user_id=$1 AND folder_id IS NOT DISTINCT FROM $2 AND trashed_at IS NULL ORDER BY stored_name`, [identity.userId, resource.folderId]),
     ]);
-    for (const folder of folders.rows) responses.push(propertyResponse({ type: 'folder', folderId: folder.id, ...folder } as DavResource, [...segments, folder.name]));
+    for (const folder of folders.rows) responses.push(propertyResponse({ type: 'folder', folderId: folder.id, ...folder } as DavResource, [...segments, folder.name], quota));
     for (const file of files.rows) responses.push(propertyResponse({ type: 'file', ...file } as DavResource, [...segments, file.name]));
   }
   req.resume();
@@ -433,7 +451,7 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
   const name = segments.at(-1)!;
   let existing = await resourceAt(identity, segments);
   if (existing?.type === 'folder') throw new DavError(405, 'A collection already exists at this path');
-  let parent = await parentFolder(identity, segments);
+  const parent = await parentFolder(identity, segments);
   const declaredLength = req.header('content-length');
   if (declaredLength !== undefined && !/^\d+$/.test(declaredLength)) throw new DavError(400, 'Invalid Content-Length');
   if (declaredLength && BigInt(declaredLength) > BigInt(config.maxUploadBytes)) throw new DavError(413, 'File is too large');
@@ -451,7 +469,7 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
   const targetRelativePath = relativePath(identity, segments);
   const targetPath = resolveInside(userFilesRoot(identity.storageKey), targetRelativePath);
   const backupPath = mutationBackupPath(stagingDirectory, operationId);
-  const client = await db.connect();
+  let client: PoolClient | undefined;
   const lockKey = `originvault:${identity.userId}`;
   let lockHeld = false;
   let transactionStarted = false;
@@ -470,13 +488,12 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
   let routeError: unknown;
   let journalWritten = false;
   let clientMtimeAccepted = false;
+  const startedAt = performance.now();
   try {
-    await client.query('SELECT pg_advisory_lock(hashtext($1))', [lockKey]);
-    lockHeld = true;
-    existing = await resourceAt(identity, segments, client);
-    if (existing?.type === 'folder') throw new DavError(405, 'A collection already exists at this path');
-    parent = await parentFolder(identity, segments, client);
-    const usage = await getStorageUsage(identity.userId, client);
+    // Receive into an isolated staging file without holding a DB connection or
+    // the user's mutation lock. Other uploads and Autosync's HEAD/DELETE/MOVE
+    // requests must not wait for this client's entire network transfer.
+    const usage = await getStorageUsage(identity.userId);
     const initialOldSize = existing?.sizeBytes ? BigInt(existing.sizeBytes) : 0n;
     let maximumTargetBytes = BigInt(config.maxUploadBytes) > initialOldSize ? BigInt(config.maxUploadBytes) : initialOldSize;
     if (usage.quotaBytes !== null) {
@@ -513,6 +530,8 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
     }
     sha256 = hash.digest('hex');
     if (declaredLength !== undefined && size !== BigInt(declaredLength)) throw new DavError(400, 'Upload body length does not match Content-Length');
+    const receivedAt = performance.now();
+    logForRequest(req).debug({ event: 'webdav_put_received', relativePath: targetRelativePath, sizeBytes: size.toString(), receiveDurationMs: receivedAt - startedAt }, 'WebDAV upload bytes received');
     let requestedLastModified = clientModifiedTime?.value ?? new Date();
     try {
       await utimes(stagedPath, new Date(), requestedLastModified);
@@ -535,7 +554,17 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
     }
     const stagedHandle = await open(stagedPath, 'r');
     try { await stagedHandle.sync(); } finally { await stagedHandle.close(); }
+    const metadata = await extractMetadata(stagedPath);
+    if (clientLastModified) metadata['WebDAV:LastModified'] = clientLastModified.toISOString();
+    const mimeType = webdavContentType(req.header('content-type'), metadata);
 
+    if (req.aborted || res.destroyed) throw new DavError(499, 'Upload connection closed before commit');
+    const preparedAt = performance.now();
+    client = await db.connect();
+    await client.query('SELECT pg_advisory_lock(hashtext($1))', [lockKey]);
+    lockHeld = true;
+    const lockedAt = performance.now();
+    if (req.aborted || res.destroyed) throw new DavError(499, 'Upload connection closed before commit');
     await client.query('BEGIN');
     transactionStarted = true;
     const currentToken = await client.query(`
@@ -550,7 +579,7 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
       const currentParent = await client.query('SELECT relative_path FROM folders WHERE id=$1 AND user_id=$2 AND trashed_at IS NULL', [parent.id, identity.userId]);
       if (!currentParent.rowCount || currentParent.rows[0].relative_path !== parent.relativePath) throw new DavError(409, 'Parent collection changed while the upload was in progress');
     }
-      const lockedFolder = await client.query('SELECT id FROM folders WHERE user_id=$1 AND relative_path=$2 AND trashed_at IS NULL', [identity.userId, targetRelativePath]);
+    const lockedFolder = await client.query('SELECT id FROM folders WHERE user_id=$1 AND relative_path=$2 AND trashed_at IS NULL', [identity.userId, targetRelativePath]);
     if (lockedFolder.rowCount) throw new DavError(405, 'A collection already exists at this path');
     const reservedUpload = await client.query(
       'SELECT 1 FROM upload_sessions WHERE user_id=$1 AND final_relative_path=$2',
@@ -605,9 +634,6 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
     try { await targetDirectory.sync(); } finally { await targetDirectory.close(); }
     const stagingHandle = await open(stagingDirectory, 'r');
     try { await stagingHandle.sync(); } finally { await stagingHandle.close(); }
-    const metadata = await extractMetadata(targetPath);
-    if (clientLastModified) metadata['WebDAV:LastModified'] = clientLastModified.toISOString();
-    const mimeType = webdavContentType(req.header('content-type'), metadata);
     if (existing) {
       await client.query(`
         UPDATE files SET folder_id=$1,original_name=$2,stored_name=$2,relative_path=$3,mime_type=$4,size_bytes=$5,sha256=$6,
@@ -640,11 +666,15 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
       clientMtimeHeader: clientModifiedTime?.headerName,
       clientMtimeAccepted,
       metadataFieldCount: Object.keys(metadata).length,
+      receiveDurationMs: receivedAt - startedAt,
+      preparationDurationMs: preparedAt - receivedAt,
+      lockWaitMs: lockedAt - preparedAt,
+      commitDurationMs: performance.now() - lockedAt,
     }, 'WebDAV upload stored and indexed without transforming the original bytes');
   } catch (error) {
     routeError = error;
-    if (transactionStarted) await client.query('ROLLBACK').catch(() => undefined);
-    if (installed) {
+    if (transactionStarted && client) await client.query('ROLLBACK').catch(() => undefined);
+    if (installed && client) {
       try {
         const state = await client.query<{ id: string; sha256: string; rowVersion: string }>(
           'SELECT id,sha256,xmin::text AS "rowVersion" FROM files WHERE id=$1 AND user_id=$2',
@@ -686,7 +716,7 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
     else if (journalWritten && installed)
       logForRequest(req).error({ event: 'webdav_put_backup_retained', targetRelativePath, backupPath: backedUp ? backupPath : undefined, operationId, stateKnown }, 'WebDAV PUT recovery artifacts were retained because database state could not be reconciled safely');
     let lockReleaseError: Error | undefined;
-    if (lockHeld) {
+    if (lockHeld && client) {
       try {
         const unlocked = await client.query<{ unlocked: boolean }>('SELECT pg_advisory_unlock(hashtext($1)) AS unlocked', [lockKey]);
         if (!unlocked.rows[0]?.unlocked) throw new Error('User mutation lock was not held by this connection');
@@ -696,7 +726,7 @@ async function handlePut(req: Request, res: Response, identity: DavIdentity, seg
     }
     if (lockReleaseError)
       logForRequest(req).error({ event: 'webdav_put_lock_release_failed', err: lockReleaseError }, 'WebDAV PUT mutation lock connection was discarded');
-    client.release(lockReleaseError);
+    client?.release(lockReleaseError);
   }
   if (!committed) throw routeError ?? new Error('WebDAV PUT failed');
   res.setHeader('ETag', `"sha256-${sha256}"`);
@@ -952,7 +982,8 @@ export function createWebdavRouter(): express.Router {
         default: throw new DavError(405, 'WebDAV method not supported');
       }
     })().catch((error: unknown) => {
-      const statusCode = error instanceof DavError || error instanceof StorageQuotaError ? error.statusCode : 500;
+      const connectionClosed = req.aborted || res.destroyed;
+      const statusCode = connectionClosed ? 499 : error instanceof DavError || error instanceof StorageQuotaError ? error.statusCode : 500;
       const fields = { event: 'webdav_request_failed', statusCode, method: req.method, err: error, aborted: req.aborted, responseDestroyed: res.destroyed };
       logForRequest(req)[statusCode >= 500 && statusCode !== 507 ? 'error' : 'warn'](fields, 'WebDAV request failed');
       if (res.destroyed) return;
