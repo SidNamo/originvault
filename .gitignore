@@ -21,3 +21,5 @@ data/postgresql/*
 coverage/
 data/
 docker-compose.yml
+
+/key/
