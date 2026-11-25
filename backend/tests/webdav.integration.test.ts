@@ -9,6 +9,7 @@ import path from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import test from 'node:test';
+import bcrypt from 'bcryptjs';
 import pg from 'pg';
 import sharp from 'sharp';
 import { config } from '../src/config.js';
@@ -32,6 +33,7 @@ test('WebDAV preserves original metadata and serves prebuilt/on-demand video pos
   const port = (listener.address() as net.AddressInfo).port;
   await new Promise<void>((resolve) => listener.close(() => resolve()));
   const origin = `http://127.0.0.1:${port}`;
+  const domainOrigin = 'https://vault.example:8443';
   Object.assign(config, {
     postgresHost: connection.hostname, postgresPort: Number(connection.port || 5432), postgresDatabase: databaseName,
     postgresUser: decodeURIComponent(connection.username), postgresPassword: decodeURIComponent(connection.password) || 'integration-password',
@@ -51,7 +53,8 @@ test('WebDAV preserves original metadata and serves prebuilt/on-demand video pos
     await mkdir(rendererBin);
     const ffmpegPath = (await execFileAsync('sh', ['-c', 'command -v ffmpeg'])).stdout.trim();
     await writeFile(path.join(rendererBin, 'ffmpeg'), `#!/bin/sh\nwhile [ ! -f "${rendererGate}" ]; do sleep 0.05; done\nexec "${ffmpegPath}" "$@"\n`, { mode: 0o755 });
-    await db.query(`INSERT INTO users(id,username,display_name,storage_key,password_hash) VALUES($1,'davtester','DAV tester',$2,'unused')`, [userId, storageKey]);
+    const password = randomBytes(16).toString('hex');
+    await db.query(`INSERT INTO users(id,username,display_name,storage_key,password_hash) VALUES($1,'davtester','DAV tester',$2,$3)`, [userId, storageKey, await bcrypt.hash(password, 4)]);
     // Invalid dates must not keep the maintenance cursor stuck ahead of a repairable legacy row.
     await db.query(`INSERT INTO files(id,user_id,original_name,stored_name,relative_path,mime_type,size_bytes,sha256,extracted_metadata)
       SELECT ('00000000-0000-4000-8000-' || lpad(n::text,12,'0'))::uuid,$1,'legacy.dat','legacy.dat','legacy-' || n || '.dat',
@@ -62,7 +65,7 @@ test('WebDAV preserves original metadata and serves prebuilt/on-demand video pos
       cwd: process.cwd(),
       env: { ...process.env, ORIGINVAULT_TEST_DATABASE_URL: connection.toString(), ORIGINVAULT_TEST_PORT: String(port),
         POSTGRES_DB: databaseName, POSTGRES_USER: config.postgresUser, POSTGRES_PASSWORD: config.postgresPassword,
-        JWT_SECRET: config.jwtSecret, SHARE_SECRET: config.shareSecret, PUBLIC_URL: origin, LOG_LEVEL: 'debug',
+        JWT_SECRET: config.jwtSecret, SHARE_SECRET: config.shareSecret, PUBLIC_URL: origin, CORS_ALLOWED_ORIGINS: domainOrigin, LOG_LEVEL: 'debug',
         MAX_UPLOAD_BYTES: '1048576', PATH: `${rendererBin}:${process.env.PATH}` },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -93,13 +96,20 @@ test('WebDAV preserves original metadata and serves prebuilt/on-demand video pos
     assert.equal(rejectedOrigin.status, 403);
     await rejectedOrigin.text();
 
-    const { signToken } = await import('../src/auth.js');
-    const sessionHeaders = { authorization: `Bearer ${signToken({ id: userId, username: 'davtester', authVersion: 0 })}`, 'content-type': 'application/json' };
     const request = async (url: string, init: RequestInit, status: number) => {
       const response = await fetch(`${origin}${url}`, { ...init, headers: { connection: 'close', ...init.headers } });
       if (response.status !== status) assert.fail(`${init.method ?? 'GET'} ${url}: ${response.status} ${await response.text()}\n${backendOutput}`);
       return response;
     };
+    const login = async (browserOrigin: string) => {
+      const response = await request('/api/auth/login', { method: 'POST', headers: { origin: browserOrigin, 'content-type': 'application/json' },
+        body: JSON.stringify({ username: 'davtester', password }) }, 200);
+      assert.equal(response.headers.get('access-control-allow-origin'), browserOrigin);
+      return (await response.json() as { token: string }).token;
+    };
+    assert.ok(await login(domainOrigin));
+    const sessionHeaders = { authorization: `Bearer ${await login(origin)}`, 'content-type': 'application/json' };
+    await (await request('/api/auth/login', { method: 'POST', headers: { origin: 'https://vault.example:8444' } }, 403)).text();
     const multipart = (name: string, body: Buffer | string, ending = '\r\n--upload-test--\r\n') => Buffer.concat([
       Buffer.from(`--upload-test\r\nContent-Disposition: form-data; name="file"; filename="${name}"\r\nContent-Type: application/octet-stream\r\n\r\n`),
       Buffer.isBuffer(body) ? body : Buffer.from(body), Buffer.from(ending),

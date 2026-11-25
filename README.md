@@ -27,8 +27,8 @@ Docker NPM은 `originvault_default` 네트워크에 연결한 뒤 `frontend:80`�
 ## 환경 변수
 
 `.env`가 배포 설정의 단일 기준입니다. 각 변수 옆에는 입력 기준을 주석으로 남겼습니다.
-파일 권한은 `600`으로 유지하고 Git에 포함하지 않습니다. API 허용 origin은
-`PUBLIC_URL`에서 자동으로 파생하므로 별도 CORS 변수는 사용하지 않습니다.
+파일 권한은 `600`으로 유지하고 Git에 포함하지 않습니다. API는 기본적으로
+`PUBLIC_URL`을 허용하며, 다른 주소에서도 로그인하려면 `CORS_ALLOWED_ORIGINS`에 추가합니다.
 Expo app의 API origin은 `app/.env.example`을 복사해 만든 `app/.env`의
 `EXPO_PUBLIC_API_URL`로 별도 관리합니다.
 
@@ -40,7 +40,8 @@ Expo app의 API origin은 `app/.env.example`을 복사해 만든 `app/.env`의
 | `JWT_SECRET` | 예 | `openssl rand -hex 32`의 고유 출력값. 변경하면 모든 로그인 세션이 만료됩니다. |
 | `SHARE_SECRET` | 예 | JWT와 다른 `openssl rand -hex 32` 출력값. 새 공개 링크 서명에 사용합니다. |
 | `LEGACY_SHARE_SECRET` | 아니오 | 예전 share/JWT key로 서명된 공개 링크를 임시 유지할 때만 입력합니다. |
-| `PUBLIC_URL` | 예 | 브라우저가 사용할 정확한 origin입니다. scheme, host, port를 모두 포함하며 CORS와 공유 URL 기준이 됩니다. |
+| `PUBLIC_URL` | 예 | 공유 링크와 WebDAV 주소를 만들 때 쓰는 대표 origin입니다. 브라우저 요청에도 항상 허용됩니다. |
+| `CORS_ALLOWED_ORIGINS` | 아니오 | 추가로 허용할 브라우저 origin 목록입니다. `scheme://host[:port]` 형식으로 쉼표로 구분합니다. |
 | `FRONTEND_PORT` | 예 | NPM 또는 browser가 연결할 frontend port입니다. |
 | `MAX_UPLOAD_BYTES` | 기본값 | 파일 하나당 업로드 상한 byte 값입니다. `10737418240`은 10 GiB입니다. |
 | `DEFAULT_STORAGE_QUOTA_BYTES` | 기본값 | 새 사용자 기본 quota byte 값입니다. 기존 사용자 quota는 바뀌지 않습니다. |
@@ -51,6 +52,7 @@ Expo app의 API origin은 `app/.env.example`을 복사해 만든 `app/.env`의
 
 ```sh
 cp .env.example .env
+cp docker-compose.yml.example docker-compose.yml
 chmod 600 .env
 # .env.example의 필수 값을 모두 입력합니다.
 docker compose up -d --build
@@ -58,18 +60,32 @@ docker compose up -d --build
 
 필수 secret 또는 network 설정이 비어 있으면 Compose는 시작하지 않습니다.
 
-## 직접 HTTP 접속
+## 도메인과 내부 IP로 접속
 
 NPM 없이 직접 접속할 때도 `PUBLIC_URL`과 frontend port를 `.env`에 정확히
 입력합니다. HTTP origin은 literal IP에만 허용됩니다. 일반 도메인은
 HTTPS를 사용해야 합니다. Router와 firewall에서는 frontend port의 접근 범위를 신뢰하는
 network로 제한합니다.
 
+예를 들어 HTTPS 도메인과 내부 IP의 `1234` 포트로 모두 로그인하려면 다음처럼 설정합니다.
+
+```dotenv
+PUBLIC_URL=https://ov.sidnamo.com
+CORS_ALLOWED_ORIGINS=http://192.168.0.2:1234
+FRONTEND_PORT=1234
+```
+
+브라우저 주소창의 프로토콜·호스트·포트가 일치해야 합니다. 같은 IP라도 포트가 다르면
+별도 origin이며, 도메인에 기본 포트가 아닌 포트를 쓸 때도 `https://ov.sidnamo.com:8443`처럼 적습니다.
+
 ## 기존 서버 업데이트
 
 업데이트 전 `data/`를 백업합니다. 기존 `POSTGRES_PASSWORD`, `JWT_SECRET`,
 `SHARE_SECRET`, `FRONTEND_PORT`는 임의로 바꾸지 않습니다. DB 연결, 로그인 세션,
 공개 링크 또는 NPM/LAN upstream이 끊길 수 있습니다.
+
+추가 origin을 사용하려면 기존 `docker-compose.yml`의 `backend.environment`에도 예제의
+`CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}` 항목을 반영합니다.
 
 ```sh
 git pull --ff-only

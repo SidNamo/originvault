@@ -9,7 +9,7 @@ import type { Pool, PoolClient } from 'pg';
 import { accountRouter, normalizeDisplayName, normalizePassword, normalizeUsername } from './accountRoutes.js';
 import { loadSessionUser, publicUser, requireAuth, signToken, type SessionUser } from './auth.js';
 import { bulkOperationsRouter } from './bulkOperations.js';
-import { config, isSupportedPublicUrlProtocol } from './config.js';
+import { config } from './config.js';
 import { db, migrate } from './db.js';
 import { resumableUploadRouter } from './resumableUploads.js';
 import { extractMetadata, isHiddenResource, originalCreatedAtFromMetadata, resolveInside, safeRelativeDirectory, safeSegment, storedContentType, storeOriginal, userFilesRoot } from './storage.js';
@@ -636,10 +636,6 @@ async function start(): Promise<void> {
   if (!Number.isSafeInteger(config.maxUploadBytes) || config.maxUploadBytes < 0) throw new Error('MAX_UPLOAD_BYTES must be a non-negative safe integer');
   if (!/^\d+$/.test(config.defaultStorageQuotaBytes)) throw new Error('DEFAULT_STORAGE_QUOTA_BYTES must be a non-negative integer');
   if (!config.publicUrl) throw new Error('PUBLIC_URL must be set');
-  let publicUrl: URL;
-  try { publicUrl = new URL(config.publicUrl); } catch { throw new Error('PUBLIC_URL must be an absolute HTTP or HTTPS URL'); }
-  if (!isSupportedPublicUrlProtocol(publicUrl) || publicUrl.pathname !== '/' || publicUrl.search || publicUrl.hash || publicUrl.username || publicUrl.password)
-    throw new Error('PUBLIC_URL must be an HTTPS origin, or an HTTP origin using a literal IP address, without credentials, path, query, or fragment');
   logger.info({ event: 'service_starting', port: config.port, dataRoot: config.dataRoot, logDir: config.logDir, logLevel: config.logLevel, logRetentionDays: config.logRetentionDays, maxUploadBytes: config.maxUploadBytes }, 'OriginVault backend starting');
   await mkdir(config.dataRoot, { recursive: true });
   logger.debug({ event: 'data_root_ready', dataRoot: config.dataRoot }, 'Data root is ready');
